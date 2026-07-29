@@ -45,8 +45,8 @@ use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::NamedColor;
 
 #[cfg(unix)]
-use crate::cli::{IpcConfig, ParsedOptions};
-use crate::cli::{Options as CliOptions, WindowOptions};
+use crate::cli::IpcConfig;
+use crate::cli::{Options as CliOptions, ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::ui_config::{HintAction, HintInternalAction};
 use crate::config::{self, UiConfig};
@@ -58,12 +58,27 @@ use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
-use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
+use crate::logging::LOG_TARGET_WINIT;
 use crate::message_bar::{Message, MessageBuffer};
 #[cfg(unix)]
 use crate::polling::ipc::{self, SocketReply};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::window_context::WindowContext;
+
+/// Stable identifier for a terminal tab inside a native window.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TabId(pub u64);
+
+/// Actions which change the tabs in a native window.
+#[derive(Debug, Clone)]
+pub enum TabAction {
+    Create(WindowOptions),
+    Close(usize),
+    Select(usize),
+    SelectNext,
+    SelectPrevious,
+    SelectLast,
+}
 
 /// Duration after the last user input until an unlimited search is performed.
 pub const TYPING_SEARCH_DELAY: Duration = Duration::from_millis(500);
@@ -287,6 +302,8 @@ impl ApplicationHandler<Event> for Processor {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
 
+        let tab_id = event.tab_id;
+
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
             // Process IPC config update.
@@ -343,8 +360,7 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::ConfigReload(path), _) => {
                 // Clear config logs from message bar for all terminals.
                 for window_context in self.windows.values_mut() {
-                    if !window_context.message_buffer.is_empty() {
-                        window_context.message_buffer.remove_target(LOG_TARGET_CONFIG);
+                    if window_context.clear_config_messages() {
                         window_context.display.pending_update.dirty = true;
                     }
                 }
@@ -389,6 +405,40 @@ impl ApplicationHandler<Event> for Processor {
                     error!("Could not open window: {err:?}");
                 }
             },
+            (EventType::TabAction(action), Some(window_id)) => {
+                #[cfg(unix)]
+                let global_overrides = &self.global_ipc_options;
+                #[cfg(not(unix))]
+                let global_overrides = &ParsedOptions::default();
+
+                let close_window = match self.windows.get_mut(window_id) {
+                    Some(window_context) => window_context.handle_tab_action(
+                        action,
+                        self.config.clone(),
+                        self.proxy.clone(),
+                        &mut self.scheduler,
+                        global_overrides,
+                    ),
+                    None => return,
+                };
+
+                match close_window {
+                    Ok(true) => {
+                        if let Some(window_context) = self.windows.remove(window_id) {
+                            self.scheduler.unschedule_window(window_context.id());
+
+                            if self.windows.is_empty() && !self.cli_options.daemon {
+                                if self.config.debug.ref_test {
+                                    window_context.write_ref_test_results();
+                                }
+                                event_loop.exit();
+                            }
+                        }
+                    },
+                    Ok(false) => (),
+                    Err(err) => error!("Could not update tabs: {err:?}"),
+                }
+            },
             // Shutdown all windows.
             #[cfg(unix)]
             (EventType::Shutdown, _) => event_loop.exit(),
@@ -408,21 +458,23 @@ impl ApplicationHandler<Event> for Processor {
             },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
-                    window_context.dirty = true;
-                    if window_context.display.window.has_frame {
-                        window_context.display.window.request_redraw();
-                    }
+                    window_context.mark_tab_dirty(tab_id);
                 }
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
+                if let Some(tab_id) = tab_id {
+                    let close_window =
+                        self.windows.get_mut(window_id).is_some_and(|window_context| {
+                            window_context.close_tab_by_id(tab_id, &mut self.scheduler)
+                        });
+                    if !close_window {
+                        return;
+                    }
+                }
+
                 // Remove the closed terminal.
                 let window_context = match self.windows.entry(*window_id) {
-                    // Don't exit when terminal exits if user asked to hold the window.
-                    Entry::Occupied(window_context)
-                        if !window_context.get().display.window.hold =>
-                    {
-                        window_context.remove()
-                    },
+                    Entry::Occupied(window_context) => window_context.remove(),
                     _ => return,
                 };
 
@@ -450,13 +502,17 @@ impl ApplicationHandler<Event> for Processor {
             },
             (payload, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    let event = match tab_id {
+                        Some(tab_id) => Event::new_for_tab(payload, *window_id, tab_id),
+                        None => Event::new(payload, *window_id),
+                    };
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
                         event_loop,
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
-                        WinitEvent::UserEvent(Event::new(payload, *window_id)),
+                        WinitEvent::UserEvent(event),
                     );
                 }
             },
@@ -520,15 +576,22 @@ impl ApplicationHandler<Event> for Processor {
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Limit event to a specific window.
-    window_id: Option<WindowId>,
+    pub(crate) window_id: Option<WindowId>,
+
+    /// Limit event to a specific tab inside the window.
+    pub(crate) tab_id: Option<TabId>,
 
     /// Event payload.
-    payload: EventType,
+    pub(crate) payload: EventType,
 }
 
 impl Event {
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
-        Self { window_id: window_id.into(), payload }
+        Self { window_id: window_id.into(), tab_id: None, payload }
+    }
+
+    pub fn new_for_tab(payload: EventType, window_id: WindowId, tab_id: TabId) -> Self {
+        Self { window_id: Some(window_id), tab_id: Some(tab_id), payload }
     }
 }
 
@@ -546,6 +609,7 @@ pub enum EventType {
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
+    TabAction(TabAction),
     #[cfg(unix)]
     IpcConfig(IpcConfig),
     #[cfg(unix)]
@@ -681,6 +745,9 @@ pub struct ActionContext<'a, N, T> {
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
+    pub tab_id: TabId,
+    pub tab_title: &'a mut String,
+    pub hold: &'a mut bool,
     #[cfg(not(windows))]
     pub master_fd: RawFd,
     #[cfg(not(windows))]
@@ -902,6 +969,44 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
     }
 
+    fn create_new_tab(&mut self) {
+        let mut options = WindowOptions::default();
+
+        #[cfg(not(windows))]
+        {
+            options.terminal_options.working_directory =
+                foreground_process_path(self.master_fd, self.shell_pid).ok();
+        }
+
+        let action = EventType::TabAction(TabAction::Create(options));
+        let _ = self.event_proxy.send_event(Event::new(action, self.display.window.id()));
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        let action = EventType::TabAction(TabAction::Select(index));
+        let _ = self.event_proxy.send_event(Event::new(action, self.display.window.id()));
+    }
+
+    fn select_next_tab(&mut self) {
+        let action = EventType::TabAction(TabAction::SelectNext);
+        let _ = self.event_proxy.send_event(Event::new(action, self.display.window.id()));
+    }
+
+    fn select_previous_tab(&mut self) {
+        let action = EventType::TabAction(TabAction::SelectPrevious);
+        let _ = self.event_proxy.send_event(Event::new(action, self.display.window.id()));
+    }
+
+    fn select_last_tab(&mut self) {
+        let action = EventType::TabAction(TabAction::SelectLast);
+        let _ = self.event_proxy.send_event(Event::new(action, self.display.window.id()));
+    }
+
+    fn quit(&mut self) {
+        *self.hold = false;
+        self.terminal.exit();
+    }
+
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
     where
         I: IntoIterator<Item = S> + Debug + Copy,
@@ -932,6 +1037,10 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.display
             .pending_update
             .set_font(self.config.font.clone().with_size(self.display.font_size));
+    }
+
+    fn tab_id(&self) -> Option<TabId> {
+        Some(self.tab_id)
     }
 
     #[inline]
@@ -1035,7 +1144,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
 
         // Force unlimited search if the previous one was interrupted.
-        let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+        let timer_id =
+            TimerId::new_for_tab(Topic::DelayedSearch, self.display.window.id(), self.tab_id);
         if self.scheduler.scheduled(timer_id) {
             self.goto_match(None);
         }
@@ -1200,7 +1310,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn on_typing_start(&mut self) {
         // Disable cursor blinking.
-        let timer_id = TimerId::new(Topic::BlinkCursor, self.display.window.id());
+        let timer_id =
+            TimerId::new_for_tab(Topic::BlinkCursor, self.display.window.id(), self.tab_id);
         if self.scheduler.unschedule(timer_id).is_some() {
             self.schedule_blinking();
 
@@ -1529,7 +1640,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     /// Reset terminal to the state before search was started.
     fn search_reset_state(&mut self) {
         // Unschedule pending timers.
-        let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+        let timer_id =
+            TimerId::new_for_tab(Topic::DelayedSearch, self.display.window.id(), self.tab_id);
         self.scheduler.unschedule(timer_id);
 
         // Clear focused match.
@@ -1583,16 +1695,28 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 self.search_state.display_offset_delta += old_offset - display_offset as i32;
 
                 // Since we found a result, we require no delayed re-search.
-                let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+                let timer_id = TimerId::new_for_tab(
+                    Topic::DelayedSearch,
+                    self.display.window.id(),
+                    self.tab_id,
+                );
                 self.scheduler.unschedule(timer_id);
             },
             // Reset viewport only when we know there is no match, to prevent unnecessary jumping.
             None if limit.is_none() => self.search_reset_state(),
             None => {
                 // Schedule delayed search if we ran into our search limit.
-                let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+                let timer_id = TimerId::new_for_tab(
+                    Topic::DelayedSearch,
+                    self.display.window.id(),
+                    self.tab_id,
+                );
                 if !self.scheduler.scheduled(timer_id) {
-                    let event = Event::new(EventType::SearchNext, self.display.window.id());
+                    let event = Event::new_for_tab(
+                        EventType::SearchNext,
+                        self.display.window.id(),
+                        self.tab_id,
+                    );
                     self.scheduler.schedule(event, TYPING_SEARCH_DELAY, false, timer_id);
                 }
 
@@ -1634,8 +1758,12 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
         // Update cursor blinking state.
         let window_id = self.display.window.id();
-        self.scheduler.unschedule(TimerId::new(Topic::BlinkCursor, window_id));
-        self.scheduler.unschedule(TimerId::new(Topic::BlinkTimeout, window_id));
+        self.scheduler.unschedule(TimerId::new_for_tab(Topic::BlinkCursor, window_id, self.tab_id));
+        self.scheduler.unschedule(TimerId::new_for_tab(
+            Topic::BlinkTimeout,
+            window_id,
+            self.tab_id,
+        ));
 
         // Reset blinking timeout.
         *self.cursor_blink_timed_out = false;
@@ -1651,8 +1779,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
     fn schedule_blinking(&mut self) {
         let window_id = self.display.window.id();
-        let timer_id = TimerId::new(Topic::BlinkCursor, window_id);
-        let event = Event::new(EventType::BlinkCursor, window_id);
+        let timer_id = TimerId::new_for_tab(Topic::BlinkCursor, window_id, self.tab_id);
+        let event = Event::new_for_tab(EventType::BlinkCursor, window_id, self.tab_id);
         let blinking_interval = Duration::from_millis(self.config.cursor.blink_interval());
         self.scheduler.schedule(event, blinking_interval, true, timer_id);
     }
@@ -1664,8 +1792,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
 
         let window_id = self.display.window.id();
-        let event = Event::new(EventType::BlinkCursorTimeout, window_id);
-        let timer_id = TimerId::new(Topic::BlinkTimeout, window_id);
+        let event = Event::new_for_tab(EventType::BlinkCursorTimeout, window_id, self.tab_id);
+        let timer_id = TimerId::new_for_tab(Topic::BlinkTimeout, window_id, self.tab_id);
 
         self.scheduler.schedule(event, blinking_timeout, false, timer_id);
     }
@@ -1853,7 +1981,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 },
                 EventType::BlinkCursorTimeout => {
                     // Disable blinking after timeout reached.
-                    let timer_id = TimerId::new(Topic::BlinkCursor, self.ctx.display.window.id());
+                    let timer_id = TimerId::new_for_tab(
+                        Topic::BlinkCursor,
+                        self.ctx.display.window.id(),
+                        self.ctx.tab_id,
+                    );
                     self.ctx.scheduler.unschedule(timer_id);
                     *self.ctx.cursor_blink_timed_out = true;
                     self.ctx.display.cursor_hidden = false;
@@ -1867,13 +1999,16 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Terminal(event) => match event {
                     TerminalEvent::Title(title) => {
                         if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
+                            *self.ctx.tab_title = title.clone();
                             self.ctx.window().set_title(title);
                         }
                     },
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
-                            self.ctx.display.window.set_title(window_config.identity.title.clone());
+                            let title = window_config.identity.title.clone();
+                            *self.ctx.tab_title = title.clone();
+                            self.ctx.display.window.set_title(title);
                         }
                     },
                     TerminalEvent::Bell => {
@@ -1933,6 +2068,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
+                | EventType::TabAction(_)
                 | EventType::Frame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
@@ -2073,21 +2209,23 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 pub struct EventProxy {
     proxy: EventLoopProxy<Event>,
     window_id: WindowId,
+    tab_id: TabId,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: TabId) -> Self {
+        Self { proxy, window_id, tab_id }
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let _ = self.proxy.send_event(Event::new_for_tab(event, self.window_id, self.tab_id));
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let _ =
+            self.proxy.send_event(Event::new_for_tab(event.into(), self.window_id, self.tab_id));
     }
 }

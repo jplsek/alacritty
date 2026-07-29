@@ -6,18 +6,23 @@ use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
 
-use crate::event::Event;
+use crate::event::{Event, TabId};
 
 /// ID uniquely identifying a timer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TimerId {
     topic: Topic,
     window_id: WindowId,
+    tab_id: Option<TabId>,
 }
 
 impl TimerId {
     pub fn new(topic: Topic, window_id: WindowId) -> Self {
-        Self { topic, window_id }
+        Self { topic, window_id, tab_id: None }
+    }
+
+    pub fn new_for_tab(topic: Topic, window_id: WindowId, tab_id: TabId) -> Self {
+        Self { topic, window_id, tab_id: Some(tab_id) }
     }
 }
 
@@ -106,5 +111,11 @@ impl Scheduler {
     /// stick around forever and cause a memory leak.
     pub fn unschedule_window(&mut self, window_id: WindowId) {
         self.timers.retain(|timer| timer.id.window_id != window_id);
+    }
+
+    /// Remove all timers scheduled for a tab.
+    pub fn unschedule_tab(&mut self, window_id: WindowId, tab_id: TabId) {
+        self.timers
+            .retain(|timer| timer.id.window_id != window_id || timer.id.tab_id != Some(tab_id));
     }
 }

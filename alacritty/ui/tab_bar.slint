@@ -1,0 +1,186 @@
+export struct TabData {
+    title: string,
+    active: bool,
+}
+
+export global TabActions {
+    callback select-tab(int);
+    callback close-tab(int);
+    callback new-tab();
+}
+
+component CloseButton inherits Rectangle {
+    callback clicked();
+    in property <bool> hovered;
+
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    background: root.hovered || close-touch.has-hover ? #ffffff18 : transparent;
+    accessible-role: button;
+    accessible-label: "Close tab";
+
+    Text {
+        text: "×";
+        color: #d7dae0;
+        font-size: 1.05rem;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    close-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component TabButton inherits Rectangle {
+    in property <TabData> tab;
+    in property <int> tab-index;
+    in property <length> assigned-width;
+    in property <bool> hovered;
+    in property <bool> close-hovered;
+
+    min-width: assigned-width;
+    preferred-width: assigned-width;
+    max-width: assigned-width;
+    height: 100%;
+    background: tab.active ? #282c34 : root.hovered || tab-touch.has-hover ? #23272f : #1b1e24;
+    accessible-role: AccessibleRole.tab;
+    accessible-label: tab.title;
+
+    tab-touch := TouchArea {
+        clicked => { TabActions.select-tab(tab-index); }
+    }
+
+    Rectangle {
+        x: 0;
+        y: parent.height - 2px;
+        width: parent.width;
+        height: 2px;
+        background: tab.active ? #5ea1ff : transparent;
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 6px;
+        spacing: 6px;
+
+        Text {
+            horizontal-stretch: 1;
+            text: tab.title;
+            color: tab.active ? #f4f6fa : #b8bdc7;
+            font-size: 0.9rem;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Rectangle {
+            width: 24px;
+            height: 100%;
+
+            CloseButton {
+                y: (parent.height - self.height) / 2;
+                hovered: root.close-hovered;
+                clicked => { TabActions.close-tab(tab-index); }
+            }
+        }
+    }
+}
+
+export component TabBar inherits Window {
+    in property <[TabData]> tabs;
+    in property <int> hovered-tab: -1;
+    in property <int> hovered-close-tab: -1;
+    in property <bool> new-tab-hovered;
+    in property <length> tab-width: 184px;
+
+    preferred-width: 800px;
+    height: 36px;
+    background: #171a1f;
+    title: "Alacritty tabs";
+
+    HorizontalLayout {
+        spacing: 0;
+
+        for tab[index] in root.tabs: TabButton {
+            tab: tab;
+            tab-index: index;
+            assigned-width: root.tab-width;
+            hovered: index == root.hovered-tab;
+            close-hovered: index == root.hovered-close-tab;
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            background: #171a1f;
+        }
+
+        Rectangle {
+            width: 40px;
+            height: 100%;
+            background: root.new-tab-hovered || add-touch.has-hover ? #252a32 : #171a1f;
+            accessible-role: button;
+            accessible-label: "New tab";
+
+            Text {
+                text: "+";
+                color: #d7dae0;
+                font-size: 1.2rem;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            add-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { TabActions.new-tab(); }
+            }
+        }
+    }
+}
+
+export component ScrollBarOverlay inherits Window {
+    in property <length> thumb-y;
+    in property <length> thumb-height: 24px;
+    in property <bool> scrollbar-visible;
+    in property <bool> hovered;
+    in property <bool> dragging;
+    callback scroll-requested(float);
+
+    preferred-width: 12px;
+    preferred-height: 600px;
+    background: transparent;
+    title: "Alacritty scrollbar";
+
+    if root.scrollbar-visible : Rectangle {
+        x: 3px;
+        width: 6px;
+        height: 100%;
+        border-radius: 3px;
+        background: root.hovered ? #ffffff0c : transparent;
+    }
+
+    if root.scrollbar-visible : Rectangle {
+        x: 3px;
+        y: root.thumb-y;
+        width: 6px;
+        height: root.thumb-height;
+        border-radius: 3px;
+        background: root.dragging ? #d7dae0c0 : root.hovered ? #d7dae098 : #d7dae068;
+        accessible-role: slider;
+        accessible-label: "Terminal scrollback";
+    }
+
+    scrollbar-touch := TouchArea {
+        enabled: root.scrollbar-visible;
+        mouse-cursor: pointer;
+        clicked => {
+            root.scroll-requested(
+                root.height > root.thumb-height
+                    ? ((self.mouse-y - root.thumb-height / 2)
+                        / (root.height - root.thumb-height)).clamp(0, 1)
+                    : 0
+            );
+        }
+    }
+}

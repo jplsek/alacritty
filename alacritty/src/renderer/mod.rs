@@ -1,31 +1,33 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::{fmt, ptr};
 
 use ahash::RandomState;
 use crossfont::Metrics;
 use glutin::context::{ContextApi, GlContext, PossiblyCurrentContext};
 use glutin::display::{GetGlDisplay, GlDisplay};
-use log::{LevelFilter, debug, info};
+use log::{debug, info, LevelFilter};
 use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 
 use crate::config::debug::RendererPreference;
-use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
+use crate::display::SizeInfo;
 use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
+use crate::renderer::tab_bar::TabBarRenderer;
 
 pub mod platform;
 pub mod rects;
 mod shader;
+mod tab_bar;
 mod text;
 
 pub use text::{GlyphCache, LoaderApi};
@@ -89,6 +91,8 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    tab_bar_renderer: TabBarRenderer,
+    scrollbar_renderer: TabBarRenderer,
     robustness: bool,
 }
 
@@ -150,15 +154,19 @@ impl Renderer {
             None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
-        let (text_renderer, rect_renderer) = if use_glsl3 {
+        let (text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer) = if use_glsl3 {
             let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
-            (text_renderer, rect_renderer)
+            let tab_bar_renderer = TabBarRenderer::new(ShaderVersion::Glsl3)?;
+            let scrollbar_renderer = TabBarRenderer::new(ShaderVersion::Glsl3)?;
+            (text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer)
         } else {
             let text_renderer =
                 TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Gles2)?;
-            (text_renderer, rect_renderer)
+            let tab_bar_renderer = TabBarRenderer::new(ShaderVersion::Gles2)?;
+            let scrollbar_renderer = TabBarRenderer::new(ShaderVersion::Gles2)?;
+            (text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer)
         };
 
         // Enable debug logging for OpenGL as well.
@@ -171,7 +179,7 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        Ok(Self { text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer, robustness })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -262,6 +270,53 @@ impl Renderer {
             // Restore viewport with padding.
             self.set_viewport(size_info);
         }
+    }
+
+    /// Composite the software-rendered Slint tab strip into the window framebuffer.
+    pub fn draw_tab_bar(
+        &mut self,
+        pixels: &[slint::Rgb8Pixel],
+        width: u32,
+        height: u32,
+        surface_width: u32,
+        surface_height: u32,
+        updated: bool,
+    ) {
+        self.tab_bar_renderer.draw_rgb(
+            pixels,
+            width,
+            height,
+            surface_width,
+            surface_height,
+            0,
+            0,
+            updated,
+        );
+    }
+
+    /// Composite the transparent Slint scrollbar into the window framebuffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_scrollbar(
+        &mut self,
+        pixels: &[slint::platform::software_renderer::PremultipliedRgbaColor],
+        width: u32,
+        height: u32,
+        surface_width: u32,
+        surface_height: u32,
+        tab_bar_height: u32,
+        updated: bool,
+    ) {
+        let x = surface_width.saturating_sub(width);
+        self.scrollbar_renderer.draw_rgba(
+            pixels,
+            width,
+            height,
+            surface_width,
+            surface_height,
+            x,
+            tab_bar_height,
+            updated,
+        );
     }
 
     /// Fill the window with `color` and `alpha`.

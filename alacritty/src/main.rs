@@ -46,6 +46,7 @@ mod polling;
 mod renderer;
 mod scheduler;
 mod string;
+mod tab_bar;
 mod window_context;
 
 mod gl {
@@ -134,6 +135,8 @@ impl Drop for TemporaryFiles {
 /// Creates a window, the terminal state, PTY, I/O event loop, input processor,
 /// config change monitor, and runs the main display loop.
 fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
+    tab_bar::init_platform()?;
+
     // Setup winit event loop.
     let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
 

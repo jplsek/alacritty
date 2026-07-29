@@ -42,8 +42,8 @@ use winit::window::{
 use alacritty_terminal::index::Point;
 
 use crate::cli::WindowOptions;
-use crate::config::UiConfig;
 use crate::config::window::{Decorations, Identity, WindowConfig};
+use crate::config::UiConfig;
 use crate::display::SizeInfo;
 
 /// Window icon for `_NET_WM_ICON` property.
@@ -250,12 +250,6 @@ impl Window {
         self.window.set_title(&self.title);
     }
 
-    /// Get the window title.
-    #[inline]
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
     #[inline]
     pub fn request_redraw(&mut self) {
         if !self.requested_redraw {
@@ -447,13 +441,14 @@ impl Window {
     }
 
     /// Adjust the IME editor position according to the new location of the cursor.
-    pub fn update_ime_position(&self, point: Point<usize>, size: &SizeInfo) {
+    pub fn update_ime_position(&self, point: Point<usize>, size: &SizeInfo, top_offset: f32) {
         // NOTE: X11 doesn't support cursor area, so we need to offset manually to not obscure
         // the text.
         let offset = if self.is_x11 { 1 } else { 0 };
         let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
-        let nspot_y =
-            f64::from(size.padding_y() + (point.line + offset) as f32 * size.cell_height());
+        let nspot_y = f64::from(
+            top_offset + size.padding_y() + (point.line + offset) as f32 * size.cell_height(),
+        );
 
         // NOTE: some compositors don't like excluding too much and try to render popup at the
         // bottom right corner of the provided area, so exclude just the full-width char to not

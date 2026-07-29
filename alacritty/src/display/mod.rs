@@ -5,7 +5,6 @@ use std::cmp;
 use std::fmt::{self, Formatter};
 use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
-use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use glutin::config::GetGlConfig;
@@ -32,30 +31,31 @@ use alacritty_terminal::index::{Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{
-    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
+    self, LineDamageBounds, Term, TermDamage, TermMode, MIN_COLUMNS, MIN_SCREEN_LINES,
 };
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
-use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
 use crate::config::font::Font;
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
+use crate::config::UiConfig;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
-use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
+use crate::display::damage::{damage_y_to_viewport_y, DamageTracker};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
-use crate::renderer::{self, GlyphCache, Renderer, platform};
+use crate::renderer::{self, platform, GlyphCache, Renderer};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
+use crate::tab_bar::{ScrollbarController, TabBarController};
 
 pub mod color;
 pub mod content;
@@ -344,6 +344,9 @@ pub struct Display {
 
     pub size_info: SizeInfo,
 
+    /// Full native surface size, including the Slint tab strip.
+    surface_size: PhysicalSize<u32>,
+
     /// Hint highlighted by the mouse.
     pub highlighted_hint: Option<HintMatch>,
     /// Frames since hint highlight was created.
@@ -446,11 +449,13 @@ impl Display {
 
         let padding = config.window.padding(window.scale_factor as f32);
         let viewport_size = window.inner_size();
+        let tab_bar_height = TabBarController::physical_height(window.scale_factor as f32);
+        let terminal_height = viewport_size.height.saturating_sub(tab_bar_height).max(1);
 
         // Create new size with at least one column and row.
         let size_info = SizeInfo::new(
             viewport_size.width as f32,
-            viewport_size.height as f32,
+            terminal_height as f32,
             cell_width,
             cell_height,
             padding.0,
@@ -527,6 +532,7 @@ impl Display {
             glyph_cache,
             hint_state,
             size_info,
+            surface_size: viewport_size,
             font_size,
             window,
             pending_renderer_update: Default::default(),
@@ -605,18 +611,7 @@ impl Display {
     }
 
     fn swap_buffers(&self) {
-        #[allow(clippy::single_match)]
-        let res = match (self.surface.deref(), &self.context.deref()) {
-            #[cfg(not(any(target_os = "macos", windows)))]
-            (Surface::Egl(surface), PossiblyCurrentContext::Egl(context))
-                if matches!(self.raw_window_handle, RawWindowHandle::Wayland(_))
-                    && !self.damage_tracker.debug =>
-            {
-                let damage = self.damage_tracker.shape_frame_damage(self.size_info.into());
-                surface.swap_buffers_with_damage(context, &damage)
-            },
-            (surface, context) => surface.swap_buffers(context),
-        };
+        let res = self.surface.swap_buffers(&self.context);
         if let Err(err) = res {
             debug!("error calling swap_buffers: {err}");
         }
@@ -681,11 +676,13 @@ impl Display {
             self.damage_tracker.frame().mark_fully_damaged();
         }
 
-        let (mut width, mut height) = (self.size_info.width(), self.size_info.height());
+        let mut surface_size = self.surface_size;
         if let Some(dimensions) = pending_update.dimensions() {
-            width = dimensions.width as f32;
-            height = dimensions.height as f32;
+            surface_size = dimensions;
         }
+        let tab_bar_height = TabBarController::physical_height(self.window.scale_factor as f32);
+        let width = surface_size.width as f32;
+        let height = surface_size.height.saturating_sub(tab_bar_height).max(1) as f32;
 
         let padding = config.window.padding(self.window.scale_factor as f32);
 
@@ -725,7 +722,7 @@ impl Display {
         }
 
         // Check if dimensions have changed.
-        if new_size != self.size_info {
+        if new_size != self.size_info || surface_size != self.surface_size {
             // Queue renderer update.
             let renderer_update = self.pending_renderer_update.get_or_insert(Default::default());
             renderer_update.resize = true;
@@ -734,6 +731,7 @@ impl Display {
             search_state.clear_focused_match();
         }
         self.size_info = new_size;
+        self.surface_size = surface_size;
     }
 
     // NOTE: Renderer updates are split off, since platforms like Wayland require resize and other
@@ -749,8 +747,8 @@ impl Display {
 
         // Resize renderer.
         if renderer_update.resize {
-            let width = NonZeroU32::new(self.size_info.width() as u32).unwrap();
-            let height = NonZeroU32::new(self.size_info.height() as u32).unwrap();
+            let width = NonZeroU32::new(self.surface_size.width).unwrap();
+            let height = NonZeroU32::new(self.surface_size.height).unwrap();
             self.surface.resize(&self.context, width, height);
         }
 
@@ -772,6 +770,7 @@ impl Display {
     /// A reference to Term whose state is being drawn must be provided.
     ///
     /// This call may block if vsync is enabled.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw<T: EventListener>(
         &mut self,
         mut terminal: MutexGuard<'_, Term<T>>,
@@ -779,6 +778,8 @@ impl Display {
         message_buffer: &MessageBuffer,
         config: &UiConfig,
         search_state: &mut SearchState,
+        tab_bar: &mut TabBarController,
+        scrollbar: &mut ScrollbarController,
     ) {
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
@@ -794,6 +795,7 @@ impl Display {
 
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
+        scrollbar.set_state(display_offset, total_lines, terminal.screen_lines());
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
 
@@ -1016,6 +1018,30 @@ impl Display {
             self.draw_hyperlink_preview(config, cursor_point, display_offset);
         }
 
+        let (tab_pixels, tab_width, tab_height, tab_updated) = tab_bar.render();
+        self.renderer.draw_tab_bar(
+            tab_pixels,
+            tab_width,
+            tab_height,
+            self.surface_size.width,
+            self.surface_size.height,
+            tab_updated,
+        );
+        let (scrollbar_pixels, scrollbar_width, scrollbar_height, scrollbar_updated, visible) =
+            scrollbar.render();
+        if visible {
+            self.renderer.draw_scrollbar(
+                scrollbar_pixels,
+                scrollbar_width,
+                scrollbar_height,
+                self.surface_size.width,
+                self.surface_size.height,
+                tab_height,
+                scrollbar_updated,
+            );
+        }
+        self.renderer.resize(&self.size_info);
+
         // Notify winit that we're about to present.
         self.window.pre_present_notify();
 
@@ -1138,7 +1164,9 @@ impl Display {
             Some(preedit) => preedit,
             None => {
                 // In case we don't have preedit, just set the popup point.
-                self.window.update_ime_position(point, &self.size_info);
+                let top_offset =
+                    TabBarController::physical_height(self.window.scale_factor as f32) as f32;
+                self.window.update_ime_position(point, &self.size_info, top_offset);
                 return;
             },
         };
@@ -1212,7 +1240,8 @@ impl Display {
             _ => end,
         };
 
-        self.window.update_ime_position(ime_popup_point, &self.size_info);
+        let top_offset = TabBarController::physical_height(self.window.scale_factor as f32) as f32;
+        self.window.update_ime_position(ime_popup_point, &self.size_info, top_offset);
     }
 
     /// Format search regex to account for the cursor and fullwidth characters.
@@ -1628,7 +1657,8 @@ fn window_size(
     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
 
     let width = (padding.0).mul_add(2., grid_width).floor();
-    let height = (padding.1).mul_add(2., grid_height).floor();
+    let tab_bar_height = TabBarController::physical_height(scale_factor) as f32;
+    let height = (padding.1).mul_add(2., grid_height).floor() + tab_bar_height;
 
     PhysicalSize::new(width as u32, height as u32)
 }
