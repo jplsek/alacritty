@@ -18,6 +18,7 @@ use glutin::platform::x11::X11GlConfigExt;
 use log::info;
 use serde_json as json;
 use slint::LogicalPosition;
+use winit::dpi::PhysicalSize;
 use winit::event::{
     ElementState, Event as WinitEvent, Modifiers, MouseButton, TouchPhase, WindowEvent,
 };
@@ -25,7 +26,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::{CursorIcon, WindowId};
 
-use alacritty_terminal::event::Event as TerminalEvent;
+use alacritty_terminal::event::{Event as TerminalEvent, OnResize};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
@@ -47,13 +48,46 @@ use crate::event::{
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
-use crate::tab_bar::{ScrollbarController, ScrollbarPointerUpdate, TabBarAction, TabBarController};
+use crate::tab_bar::{
+    ScrollbarController, ScrollbarPointerUpdate, TabBarAction, TabBarController,
+    TabBarPointerUpdate,
+};
 use crate::{input, renderer};
 
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
 
+fn index_after_move(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_after_move;
+
+    #[test]
+    fn active_tab_index_follows_reordered_tabs() {
+        assert_eq!(index_after_move(0, 0, 2), 2);
+        assert_eq!(index_after_move(1, 0, 2), 0);
+        assert_eq!(index_after_move(2, 0, 2), 1);
+
+        assert_eq!(index_after_move(2, 2, 0), 0);
+        assert_eq!(index_after_move(0, 2, 0), 1);
+        assert_eq!(index_after_move(1, 2, 0), 2);
+
+        assert_eq!(index_after_move(3, 1, 2), 3);
+    }
+}
+
 /// State owned by one terminal tab.
-struct TerminalTab {
+pub(crate) struct TerminalTab {
     id: TabId,
     title: String,
     message_buffer: MessageBuffer,
@@ -64,6 +98,7 @@ struct TerminalTab {
     inline_search_state: InlineSearchState,
     search_state: SearchState,
     notifier: Notifier,
+    event_proxy: EventProxy,
     mouse: Mouse,
     touch: TouchPurpose,
     preserve_title: bool,
@@ -137,6 +172,7 @@ impl TerminalTab {
             #[cfg(not(windows))]
             shell_pid,
             config,
+            event_proxy,
             notifier: Notifier(loop_tx),
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
@@ -161,12 +197,38 @@ impl TerminalTab {
             self.title = self.config.window.identity.title.clone();
         }
     }
+
+    fn retarget_window(&mut self, window_id: WindowId) {
+        self.event_proxy.set_window_id(window_id);
+        self.event_queue.retain_mut(|queued_event| {
+            let WinitEvent::UserEvent(event) = queued_event else {
+                return false;
+            };
+
+            event.window_id = Some(window_id);
+            true
+        });
+    }
+
+    pub(crate) fn id(&self) -> TabId {
+        self.id
+    }
+
+    pub(crate) fn config(&self) -> Rc<UiConfig> {
+        self.config.clone()
+    }
 }
 
 impl Drop for TerminalTab {
     fn drop(&mut self) {
         let _ = self.notifier.0.send(Msg::Shutdown);
     }
+}
+
+pub(crate) struct TabDetachState {
+    index: usize,
+    active_tab: usize,
+    old_config: Rc<UiConfig>,
 }
 
 /// Event context for one individual Alacritty native window.
@@ -236,6 +298,44 @@ impl WindowContext {
         mut options: WindowOptions,
         config_overrides: ParsedOptions,
     ) -> Result<Self, Box<dyn Error>> {
+        let display = Self::additional_display(gl_config, event_loop, &config, &mut options, None)?;
+
+        let mut window_context = Self::new(display, config, options, proxy)?;
+        window_context.tabs[0].window_config = config_overrides;
+
+        Ok(window_context)
+    }
+
+    pub(crate) fn additional_with_tab(
+        gl_config: &GlutinConfig,
+        event_loop: &ActiveEventLoop,
+        tab: TerminalTab,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self, (Box<dyn Error>, TerminalTab)> {
+        let config = tab.config();
+        let mut options = WindowOptions::default();
+        let display = match Self::additional_display(
+            gl_config,
+            event_loop,
+            &config,
+            &mut options,
+            Some(size),
+        ) {
+            Ok(display) => display,
+            Err(err) => return Err((err, tab)),
+        };
+
+        Self::from_tab(display, tab, true)
+            .map_err(|(err, tab)| (Box::new(err) as Box<dyn Error>, tab))
+    }
+
+    fn additional_display(
+        gl_config: &GlutinConfig,
+        event_loop: &ActiveEventLoop,
+        config: &UiConfig,
+        options: &mut WindowOptions,
+        requested_size: Option<PhysicalSize<u32>>,
+    ) -> Result<Display, Box<dyn Error>> {
         let gl_display = gl_config.display();
 
         let mut identity = config.window.identity.clone();
@@ -243,22 +343,21 @@ impl WindowContext {
 
         let window = Window::new(
             event_loop,
-            &config,
+            config,
             &identity,
-            &mut options,
+            options,
             #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
             gl_config.x11_visual(),
         )?;
 
+        if let Some(size) = requested_size {
+            window.request_inner_size(size);
+        }
+
         let raw_window_handle = window.raw_window_handle();
         let gl_context =
             renderer::platform::create_gl_context(&gl_display, gl_config, Some(raw_window_handle))?;
-        let display = Display::new(window, gl_context, &config, false)?;
-
-        let mut window_context = Self::new(display, config, options, proxy)?;
-        window_context.tabs[0].window_config = config_overrides;
-
-        Ok(window_context)
+        Display::new(window, gl_context, config, false).map_err(Into::into)
     }
 
     fn new(
@@ -267,14 +366,37 @@ impl WindowContext {
         options: WindowOptions,
         proxy: EventLoopProxy<Event>,
     ) -> Result<Self, Box<dyn Error>> {
-        let tab = TerminalTab::new(&display, config, options, proxy.clone())?;
-        let mut tab_bar = TabBarController::new()?;
-        let mut scrollbar = ScrollbarController::new()?;
+        let tab = TerminalTab::new(&display, config, options, proxy)?;
+        Self::from_tab(display, tab, false).map_err(|(err, _tab)| Box::new(err) as Box<dyn Error>)
+    }
+
+    fn from_tab(
+        mut display: Display,
+        mut tab: TerminalTab,
+        moved_between_windows: bool,
+    ) -> Result<Self, (slint::PlatformError, TerminalTab)> {
+        let mut tab_bar = match TabBarController::new() {
+            Ok(tab_bar) => tab_bar,
+            Err(err) => return Err((err, tab)),
+        };
+        let mut scrollbar = match ScrollbarController::new() {
+            Ok(scrollbar) => scrollbar,
+            Err(err) => return Err((err, tab)),
+        };
 
         let size = display.window.inner_size();
         let scale_factor = display.window.scale_factor as f32;
         tab_bar.resize(size.width, scale_factor);
         scrollbar.resize(size.width, size.height, scale_factor);
+
+        if moved_between_windows {
+            let window_id = display.window.id();
+            tab.retarget_window(window_id);
+            tab.notifier.on_resize(display.size_info.into());
+            tab.terminal.lock().resize(display.size_info);
+            tab.terminal.lock().is_focused = true;
+            display.window.set_title(tab.title.clone());
+        }
 
         let window_context = Self {
             display,
@@ -288,6 +410,11 @@ impl WindowContext {
             dirty: true,
         };
         window_context.sync_tab_bar();
+        if moved_between_windows {
+            window_context.tabs[0]
+                .event_proxy
+                .send_event(TerminalEvent::CursorBlinkingChange.into());
+        }
         Ok(window_context)
     }
 
@@ -580,11 +707,18 @@ impl WindowContext {
                 return None;
             },
             WindowEvent::CursorMoved { device_id, mut position } => {
+                let window_size = self.display.window.inner_size();
+                let pointer_inside_window = position.x >= 0.
+                    && position.y >= 0.
+                    && position.x < window_size.width as f64
+                    && position.y < window_size.height as f64;
+                self.tab_bar.set_pointer_inside_window(pointer_inside_window);
                 let logical = position.to_logical::<f32>(scale_factor);
                 let logical_position = LogicalPosition::new(logical.x, logical.y);
                 let tab_update =
                     self.tab_bar.move_pointer(LogicalPosition::new(logical.x, logical.y));
                 let scrollbar_update = self.scrollbar.move_pointer(logical_position);
+                let tab_captured = tab_update.captured;
                 let scrollbar_captured = scrollbar_update.captured;
                 let cursor = if tab_update.pointer_cursor || scrollbar_update.pointer_cursor {
                     CursorIcon::Pointer
@@ -593,23 +727,21 @@ impl WindowContext {
                 };
                 self.display.window.set_mouse_visible(true);
                 self.display.window.set_mouse_cursor(cursor);
+                self.handle_tab_bar_update(tab_update, event_proxy, scheduler);
                 self.handle_scrollbar_update(scrollbar_update, event_proxy);
-                self.request_slint_redraw(tab_update.redraw);
 
-                if position.y < tab_height || scrollbar_captured {
+                if position.y < tab_height || tab_captured || scrollbar_captured {
                     return None;
                 }
                 position.y -= tab_height;
                 WindowEvent::CursorMoved { device_id, position }
             },
             WindowEvent::MouseInput { device_id, state, button } => {
-                if self.tab_bar.contains_pointer() {
+                if self.tab_bar.contains_pointer() || self.tab_bar.captures_pointer() {
                     self.display.window.set_mouse_visible(true);
-                    if button == MouseButton::Left
-                        && let Some(action) =
-                            self.tab_bar.pointer_button(state == ElementState::Pressed)
-                    {
-                        self.handle_tab_bar_action(action, event_proxy, scheduler);
+                    if button == MouseButton::Left {
+                        let update = self.tab_bar.pointer_button(state == ElementState::Pressed);
+                        self.handle_tab_bar_update(update, event_proxy, scheduler);
                     }
                     return None;
                 }
@@ -624,35 +756,44 @@ impl WindowContext {
                 WindowEvent::MouseInput { device_id, state, button }
             },
             WindowEvent::MouseWheel { device_id, delta, phase } => {
-                if self.tab_bar.contains_pointer() {
+                if self.tab_bar.contains_pointer() || self.tab_bar.captures_pointer() {
                     return None;
                 }
                 WindowEvent::MouseWheel { device_id, delta, phase }
             },
             WindowEvent::CursorLeft { device_id } => {
+                let tab_captured = self.tab_bar.captures_pointer();
                 let redraw = self.tab_bar.pointer_exited() | self.scrollbar.pointer_exited();
                 self.request_slint_redraw(redraw);
+                if tab_captured {
+                    return None;
+                }
                 WindowEvent::CursorLeft { device_id }
             },
             WindowEvent::Touch(mut touch) => {
+                let window_size = self.display.window.inner_size();
+                let pointer_inside_window = touch.location.x >= 0.
+                    && touch.location.y >= 0.
+                    && touch.location.x < window_size.width as f64
+                    && touch.location.y < window_size.height as f64;
+                self.tab_bar.set_pointer_inside_window(pointer_inside_window);
                 let logical = touch.location.to_logical::<f32>(scale_factor);
                 let logical_position = LogicalPosition::new(logical.x, logical.y);
                 let tab_update = self.tab_bar.move_pointer(logical_position);
                 let mut scrollbar_update = self.scrollbar.move_pointer(logical_position);
-                self.request_slint_redraw(tab_update.redraw);
-                if touch.location.y < tab_height {
-                    let action = match touch.phase {
+                let tab_captured = tab_update.captured;
+                self.handle_tab_bar_update(tab_update, event_proxy, scheduler);
+                if touch.location.y < tab_height || tab_captured {
+                    let update = match touch.phase {
                         TouchPhase::Started => self.tab_bar.pointer_button(true),
                         TouchPhase::Ended => self.tab_bar.pointer_button(false),
                         TouchPhase::Cancelled => {
-                            self.tab_bar.cancel_pointer_press();
-                            None
+                            let redraw = self.tab_bar.cancel_pointer_press();
+                            TabBarPointerUpdate { redraw, ..Default::default() }
                         },
-                        TouchPhase::Moved => None,
+                        TouchPhase::Moved => TabBarPointerUpdate::default(),
                     };
-                    if let Some(action) = action {
-                        self.handle_tab_bar_action(action, event_proxy, scheduler);
-                    }
+                    self.handle_tab_bar_update(update, event_proxy, scheduler);
                     return None;
                 }
                 if scrollbar_update.captured {
@@ -721,6 +862,18 @@ impl WindowContext {
         let _ = event_proxy.send_event(event);
     }
 
+    fn handle_tab_bar_update(
+        &mut self,
+        update: TabBarPointerUpdate,
+        event_proxy: &EventLoopProxy<Event>,
+        scheduler: &mut Scheduler,
+    ) {
+        self.request_slint_redraw(update.redraw);
+        if let Some(action) = update.action {
+            self.handle_tab_bar_action(action, event_proxy, scheduler);
+        }
+    }
+
     fn request_slint_redraw(&mut self, redraw: bool) {
         if !redraw {
             return;
@@ -746,6 +899,11 @@ impl WindowContext {
             },
             TabBarAction::Close(index) => {
                 self.close_tab(index, scheduler);
+            },
+            TabBarAction::Reorder { from, to } => self.reorder_tab(from, to),
+            TabBarAction::Detach(index) => {
+                let action = EventType::TabAction(TabAction::Detach(index));
+                let _ = event_proxy.send_event(Event::new(action, self.id()));
             },
             TabBarAction::New => {
                 let action = EventType::TabAction(TabAction::Create(WindowOptions::default()));
@@ -806,6 +964,66 @@ impl WindowContext {
         self.close_tab(index, scheduler)
     }
 
+    pub(crate) fn contains_tab(&self, tab_id: TabId) -> bool {
+        self.tabs.iter().any(|tab| tab.id == tab_id)
+    }
+
+    pub(crate) fn take_tab_for_detach(
+        &mut self,
+        index: usize,
+    ) -> Option<(TerminalTab, TabDetachState)> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+
+        let state = TabDetachState {
+            index,
+            active_tab: self.active_tab,
+            old_config: self.tabs[self.active_tab].config.clone(),
+        };
+        let tab = self.tabs.remove(index);
+        tab.terminal.lock().is_focused = false;
+        Some((tab, state))
+    }
+
+    pub(crate) fn restore_detached_tab(&mut self, tab: TerminalTab, state: TabDetachState) {
+        self.tabs.insert(state.index.min(self.tabs.len()), tab);
+        self.active_tab = state.active_tab.min(self.tabs.len() - 1);
+        self.tabs[self.active_tab].terminal.lock().is_focused = self.focused;
+        self.sync_tab_bar();
+        self.dirty = true;
+        if self.display.window.has_frame && !self.occluded {
+            self.display.window.request_redraw();
+        }
+    }
+
+    pub(crate) fn finish_tab_detach(&mut self, state: TabDetachState) -> bool {
+        if self.tabs.is_empty() {
+            return true;
+        }
+
+        let detached_active_tab = state.index == state.active_tab;
+        if state.index < state.active_tab {
+            self.active_tab = state.active_tab - 1;
+        } else if state.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else {
+            self.active_tab = state.active_tab;
+        }
+
+        if detached_active_tab {
+            self.activate_tab(self.active_tab, &state.old_config);
+        } else {
+            self.sync_tab_bar();
+            self.dirty = true;
+            if self.display.window.has_frame && !self.occluded {
+                self.display.window.request_redraw();
+            }
+        }
+
+        false
+    }
+
     fn close_tab(&mut self, index: usize, scheduler: &mut Scheduler) -> bool {
         if index >= self.tabs.len() {
             return false;
@@ -848,6 +1066,21 @@ impl WindowContext {
         let old_config = self.tabs[self.active_tab].config.clone();
         self.tabs[self.active_tab].terminal.lock().is_focused = false;
         self.activate_tab(index, &old_config);
+    }
+
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = index_after_move(self.active_tab, from, to);
+        self.sync_tab_bar();
+        self.dirty = true;
+        if self.display.window.has_frame && !self.occluded {
+            self.display.window.request_redraw();
+        }
     }
 
     fn activate_tab(&mut self, index: usize, old_config: &UiConfig) {

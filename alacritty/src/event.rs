@@ -15,7 +15,6 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
-#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
@@ -25,6 +24,7 @@ use crossfont::Size as FontSize;
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
+use parking_lot::RwLock;
 use winit::application::ApplicationHandler;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
@@ -74,6 +74,7 @@ pub struct TabId(pub u64);
 pub enum TabAction {
     Create(WindowOptions),
     Close(usize),
+    Detach(usize),
     Select(usize),
     SelectNext,
     SelectPrevious,
@@ -209,6 +210,63 @@ impl Processor {
         Ok(())
     }
 
+    /// Move an existing terminal tab into a newly created native window.
+    fn detach_tab(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_window_id: WindowId,
+        tab_index: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(source_size) = self
+            .windows
+            .get(&source_window_id)
+            .map(|window_context| window_context.display.window.inner_size())
+        else {
+            return Ok(());
+        };
+
+        // Avoid locking another window's backing buffer while creating the destination context.
+        for window_context in self.windows.values_mut() {
+            window_context.display.make_not_current();
+        }
+
+        let Some((tab, detach_state)) = self
+            .windows
+            .get_mut(&source_window_id)
+            .and_then(|window_context| window_context.take_tab_for_detach(tab_index))
+        else {
+            return Ok(());
+        };
+        let tab_id = tab.id();
+
+        let gl_config = self.gl_config.as_ref().unwrap();
+        match WindowContext::additional_with_tab(gl_config, event_loop, tab, source_size) {
+            Ok(window_context) => {
+                let destination_window_id = window_context.id();
+                self.windows.insert(destination_window_id, window_context);
+                self.scheduler.unschedule_tab(source_window_id, tab_id);
+
+                let source_empty = self
+                    .windows
+                    .get_mut(&source_window_id)
+                    .is_some_and(|window_context| window_context.finish_tab_detach(detach_state));
+                if source_empty {
+                    if let Some(window_context) = self.windows.remove(&source_window_id) {
+                        self.scheduler.unschedule_window(window_context.id());
+                    }
+                }
+
+                Ok(())
+            },
+            Err((err, tab)) => {
+                if let Some(window_context) = self.windows.get_mut(&source_window_id) {
+                    window_context.restore_detached_tab(tab, detach_state);
+                }
+                Err(err)
+            },
+        }
+    }
+
     /// Run the event loop.
     ///
     /// The result is exit code generate from the loop.
@@ -297,9 +355,24 @@ impl ApplicationHandler<Event> for Processor {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, mut event: Event) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
+        }
+
+        // A terminal can move between native windows while its already-emitted events are queued.
+        // Resolve stale window IDs through the stable tab ID before dispatching them.
+        if let (Some(window_id), Some(tab_id)) = (event.window_id, event.tab_id)
+            && !self
+                .windows
+                .get(&window_id)
+                .is_some_and(|window_context| window_context.contains_tab(tab_id))
+            && let Some(current_window_id) = self
+                .windows
+                .iter()
+                .find_map(|(window_id, context)| context.contains_tab(tab_id).then_some(*window_id))
+        {
+            event.window_id = Some(current_window_id);
         }
 
         let tab_id = event.tab_id;
@@ -403,6 +476,11 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 } else if let Err(err) = self.create_window(event_loop, options) {
                     error!("Could not open window: {err:?}");
+                }
+            },
+            (EventType::TabAction(TabAction::Detach(index)), Some(window_id)) => {
+                if let Err(err) = self.detach_tab(event_loop, *window_id, index) {
+                    error!("Could not detach tab: {err:?}");
                 }
             },
             (EventType::TabAction(action), Some(window_id)) => {
@@ -2208,24 +2286,32 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 #[derive(Debug, Clone)]
 pub struct EventProxy {
     proxy: EventLoopProxy<Event>,
-    window_id: WindowId,
+    window_id: Arc<RwLock<WindowId>>,
     tab_id: TabId,
 }
 
 impl EventProxy {
     pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: TabId) -> Self {
-        Self { proxy, window_id, tab_id }
+        Self { proxy, window_id: Arc::new(RwLock::new(window_id)), tab_id }
+    }
+
+    pub fn set_window_id(&self, window_id: WindowId) {
+        *self.window_id.write() = window_id;
+    }
+
+    fn window_id(&self) -> WindowId {
+        *self.window_id.read()
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new_for_tab(event, self.window_id, self.tab_id));
+        let _ = self.proxy.send_event(Event::new_for_tab(event, self.window_id(), self.tab_id));
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
         let _ =
-            self.proxy.send_event(Event::new_for_tab(event.into(), self.window_id, self.tab_id));
+            self.proxy.send_event(Event::new_for_tab(event.into(), self.window_id(), self.tab_id));
     }
 }

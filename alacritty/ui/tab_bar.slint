@@ -40,12 +40,17 @@ component TabButton inherits Rectangle {
     in property <length> assigned-width;
     in property <bool> hovered;
     in property <bool> close-hovered;
+    in property <bool> dragging;
 
     min-width: assigned-width;
     preferred-width: assigned-width;
     max-width: assigned-width;
     height: 100%;
-    background: tab.active ? #282c34 : root.hovered || tab-touch.has-hover ? #23272f : #1b1e24;
+    background: root.dragging
+        ? #343a46
+        : tab.active ? #282c34 : root.hovered || tab-touch.has-hover ? #23272f : #1b1e24;
+    border-width: root.dragging ? 1px : 0px;
+    border-color: #5ea1ff80;
     accessible-role: AccessibleRole.tab;
     accessible-label: tab.title;
 
@@ -93,6 +98,7 @@ export component TabBar inherits Window {
     in property <int> hovered-tab: -1;
     in property <int> hovered-close-tab: -1;
     in property <bool> new-tab-hovered;
+    in property <int> dragged-tab: -1;
     in property <length> tab-width: 184px;
 
     preferred-width: 800px;
@@ -109,6 +115,7 @@ export component TabBar inherits Window {
             assigned-width: root.tab-width;
             hovered: index == root.hovered-tab;
             close-hovered: index == root.hovered-close-tab;
+            dragging: index == root.dragged-tab;
         }
 
         Rectangle {
