@@ -450,8 +450,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             self.update_selection_scrolling(y);
         }
 
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let old_point = self.ctx.mouse().point(&size_info, display_offset);
+        let old_point = self.mouse_point();
 
         let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
@@ -461,7 +460,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
 
-        let point = self.ctx.mouse().point(&size_info, display_offset);
+        let point = self.mouse_point();
         let cell_changed = old_point != point;
 
         // If the mouse hasn't changed cells, do nothing.
@@ -526,9 +525,21 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
+    /// Convert the mouse position to a point which is valid for the terminal's current grid.
+    ///
+    /// Display and terminal dimensions normally change together, but a newly activated tab can
+    /// briefly retain its previous grid dimensions while a display update is pending.
+    fn mouse_point(&self) -> Point {
+        let terminal = self.ctx.terminal();
+        let display_offset = terminal.grid().display_offset();
+        let mut point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        point.line = point.line.clamp(terminal.topmost_line(), terminal.bottommost_line());
+        point.column = min(point.column, terminal.last_column());
+        point
+    }
+
     fn mouse_report(&mut self, button: u8, state: ElementState) {
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        let point = self.mouse_point();
 
         // Assure the mouse point is not in the scrollback.
         if point.line < 0 {
@@ -635,8 +646,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             };
 
             // Load mouse point, treating message bar and padding as the closest cell.
-            let display_offset = self.ctx.terminal().grid().display_offset();
-            let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+            let point = self.mouse_point();
 
             if let MouseButton::Left = button {
                 self.on_left_click(point)
@@ -1071,8 +1081,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             + size.cell_height() as usize * (size.screen_lines() + search_height);
 
         let mouse = self.ctx.mouse();
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        let point = self.mouse_point();
 
         if self.ctx.message().is_none() || (mouse.y <= terminal_end) {
             None
@@ -1087,8 +1096,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Icon state of the cursor.
     fn cursor_state(&mut self) -> CursorIcon {
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        let point = self.mouse_point();
         let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
 
         // Function to check if mouse is on top of a hint.
@@ -1352,6 +1360,35 @@ mod tests {
                 assert_eq!(processor.ctx.mouse.click_state, $end_state);
             }
         }
+    }
+
+    #[test]
+    fn mouse_point_is_clamped_to_terminal_grid() {
+        let mut clipboard = Clipboard::new_nop();
+        let config = UiConfig::default();
+        let terminal_size = SizeInfo::new(120., 24., 1., 1., 0., 0., false);
+        let display_size = SizeInfo::new(121., 25., 1., 1., 0., 0., false);
+        let mut terminal = Term::new(config.term_options(), &terminal_size, MockEventProxy);
+        let mut mouse = Mouse { x: 120, y: 24, ..Mouse::default() };
+        let mut inline_search_state = InlineSearchState::default();
+        let mut message_buffer = MessageBuffer::default();
+
+        let context = ActionContext {
+            terminal: &mut terminal,
+            mouse: &mut mouse,
+            size_info: &display_size,
+            clipboard: &mut clipboard,
+            modifiers: Default::default(),
+            message_buffer: &mut message_buffer,
+            inline_search_state: &mut inline_search_state,
+            config: &config,
+        };
+        let processor = Processor::new(context);
+
+        let point = processor.mouse_point();
+        assert_eq!(point.column, processor.ctx.terminal.last_column());
+        assert_eq!(point.line, processor.ctx.terminal.bottommost_line());
+        let _ = processor.ctx.terminal.grid()[point].hyperlink();
     }
 
     macro_rules! test_process_binding {

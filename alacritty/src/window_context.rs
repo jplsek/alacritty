@@ -604,8 +604,14 @@ impl WindowContext {
         }
 
         // Background tabs retain their staged events until selected.
+        let events = mem::take(&mut self.tabs[self.active_tab].event_queue);
+
+        // Tab activation can change both the active terminal and its geometry. Apply that update
+        // before dispatching queued input, since mouse points are calculated from `size_info` and
+        // must address the same grid dimensions.
+        self.flush_active_display_update();
+
         let tab = &mut self.tabs[self.active_tab];
-        let events = mem::take(&mut tab.event_queue);
         let mut terminal = tab.terminal.lock();
         let old_is_searching = tab.search_state.history_index.is_some();
 
@@ -1110,6 +1116,32 @@ impl WindowContext {
                 .enumerate()
                 .map(|(index, tab)| (tab.title.clone(), index == self.active_tab)),
         );
+    }
+
+    /// Apply pending display geometry to the active terminal before processing its input queue.
+    fn flush_active_display_update(&mut self) {
+        if !self.display.pending_update.dirty {
+            return;
+        }
+
+        let tab = &mut self.tabs[self.active_tab];
+        let mut terminal = tab.terminal.lock();
+        let old_is_searching = tab.search_state.history_index.is_some();
+        Self::submit_display_update(
+            &mut terminal,
+            &mut self.display,
+            &mut tab.notifier,
+            &tab.message_buffer,
+            &mut tab.search_state,
+            old_is_searching,
+            &tab.config,
+        );
+
+        let size = self.display.window.inner_size();
+        let scale_factor = self.display.window.scale_factor as f32;
+        self.tab_bar.resize(size.width, scale_factor);
+        self.scrollbar.resize(size.width, size.height, scale_factor);
+        self.dirty = true;
     }
 
     /// ID of this native window.
