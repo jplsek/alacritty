@@ -2,6 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use alacritty_terminal::grid::CommandMark;
+use alacritty_terminal::index::Line;
+
 use slint::platform::software_renderer::{PremultipliedRgbaColor, SoftwareRenderer};
 use slint::platform::{Platform, PlatformError, Renderer, WindowAdapter, WindowEvent};
 use slint::{
@@ -18,6 +21,11 @@ pub const TAB_BAR_HEIGHT: f32 = 36.;
 pub const SCROLLBAR_WIDTH: f32 = 12.;
 
 const MIN_SCROLLBAR_THUMB_HEIGHT: f32 = 24.;
+const COMMAND_MARK_HEIGHT: f32 = 2.;
+const COMMAND_MARK_HOVER_RADIUS: f32 = 4.;
+const TOOLTIP_WIDTH: f32 = 320.;
+const TOOLTIP_HEIGHT: f32 = 32.;
+const TOOLTIP_GAP: f32 = 6.;
 
 const TAB_DRAG_THRESHOLD: f32 = 6.;
 
@@ -479,6 +487,20 @@ pub struct ScrollbarController {
     hovered: bool,
     dragging: bool,
     drag_offset: f32,
+    command_marks: Vec<(f32, CommandMark)>,
+    mark_model: Rc<VecModel<ScrollbarCommandMark>>,
+    tooltip: CommandMarkTooltip,
+    tooltip_adapter: Rc<SlintWindowAdapter>,
+    tooltip_pixels: Vec<PremultipliedRgbaColor>,
+    tooltip_y: Option<f32>,
+}
+
+pub struct CommandTooltipFrame<'a> {
+    pub pixels: &'a [PremultipliedRgbaColor],
+    pub size: PhysicalSize,
+    pub x: u32,
+    pub y: u32,
+    pub updated: bool,
 }
 
 impl ScrollbarController {
@@ -487,7 +509,14 @@ impl ScrollbarController {
         PENDING_ADAPTERS.with(|pending| pending.borrow_mut().push_back(adapter.clone()));
 
         let component = ScrollBarOverlay::new()?;
+        let mark_model = Rc::new(VecModel::default());
+        component.set_command_marks(ModelRc::from(mark_model.clone()));
         component.show()?;
+
+        let tooltip_adapter = SlintWindowAdapter::new(TOOLTIP_WIDTH as u32, TOOLTIP_HEIGHT as u32);
+        PENDING_ADAPTERS.with(|pending| pending.borrow_mut().push_back(tooltip_adapter.clone()));
+        let tooltip = CommandMarkTooltip::new()?;
+        tooltip.show()?;
 
         Ok(Self {
             adapter,
@@ -499,6 +528,12 @@ impl ScrollbarController {
             hovered: false,
             dragging: false,
             drag_offset: 0.,
+            command_marks: Vec::new(),
+            mark_model,
+            tooltip,
+            tooltip_adapter,
+            tooltip_pixels: Vec::new(),
+            tooltip_y: None,
         })
     }
 
@@ -508,6 +543,13 @@ impl ScrollbarController {
         let scrollbar_height = height.saturating_sub(tab_bar_height).max(1);
         self.surface_width = width as f32 / scale_factor;
         self.adapter.resize(scrollbar_width, scrollbar_height, scale_factor);
+        let tooltip_width =
+            (self.surface_width - SCROLLBAR_WIDTH - TOOLTIP_GAP).clamp(1., TOOLTIP_WIDTH);
+        self.tooltip_adapter.resize(
+            (tooltip_width * scale_factor).round() as u32,
+            ((TOOLTIP_HEIGHT * scale_factor).round() as u32).min(scrollbar_height),
+            scale_factor,
+        );
         self.update_component_state();
         self.pixels.resize(
             scrollbar_width as usize * scrollbar_height as usize,
@@ -529,6 +571,44 @@ impl ScrollbarController {
         self.update_component_state();
     }
 
+    pub fn set_command_marks<'a>(
+        &mut self,
+        marks: impl Iterator<Item = (Line, &'a CommandMark)> + Clone,
+    ) {
+        let max_y = (self.logical_size().height - COMMAND_MARK_HEIGHT).max(0.);
+        let history_size = self.state.history_size;
+        let last_line = (history_size + self.state.screen_lines).saturating_sub(1).max(1);
+        let projected = marks.map(move |(line, mark)| {
+            let fraction = (line.0 + history_size as i32) as f32 / last_line as f32;
+            ((fraction * max_y).round().clamp(0., max_y), mark)
+        });
+        let mut current = self.command_marks.iter();
+        let unchanged = projected.clone().all(|(y, mark)| {
+            current.next().is_some_and(|(old_y, old)| y == *old_y && old.eq(mark))
+        });
+        if unchanged && current.next().is_none() {
+            return;
+        }
+
+        self.command_marks.clear();
+        self.command_marks.extend(projected.map(|(y, mark)| (y, mark.clone())));
+        self.mark_model.set_vec(
+            self.command_marks
+                .iter()
+                .map(|(y, mark)| ScrollbarCommandMark {
+                    y: *y,
+                    status: match mark.status {
+                        None => TabCommandStatus::None,
+                        Some(0) => TabCommandStatus::Success,
+                        Some(_) => TabCommandStatus::Failure,
+                    },
+                })
+                .collect::<Vec<_>>(),
+        );
+        self.update_component_state();
+        self.update_tooltip();
+    }
+
     pub fn render(&mut self) -> (&[PremultipliedRgbaColor], u32, u32, bool, bool) {
         slint::platform::update_timers_and_animations();
 
@@ -544,6 +624,39 @@ impl ScrollbarController {
         }
 
         (&self.pixels, size.width, size.height, redraw, self.visible())
+    }
+
+    pub fn render_tooltip(&mut self) -> Option<CommandTooltipFrame<'_>> {
+        let mark_y = self.tooltip_y?;
+        let size = self.tooltip_adapter.size.get();
+        let track = self.adapter.size.get();
+        let scale = self.adapter.window.scale_factor();
+        if size.width < (48. * scale) as u32 {
+            return None;
+        }
+
+        let updated = self.tooltip_adapter.redraw_requested.replace(false);
+        if updated {
+            self.tooltip_pixels.resize(
+                size.width as usize * size.height as usize,
+                PremultipliedRgbaColor::default(),
+            );
+            self.tooltip_adapter.renderer.render(&mut self.tooltip_pixels, size.width as usize);
+        }
+        let surface_width = (self.surface_width * scale).round() as u32;
+        let x =
+            surface_width.saturating_sub(track.width + size.width + (TOOLTIP_GAP * scale) as u32);
+        let y = ((mark_y * scale).round() as u32)
+            .saturating_sub(size.height / 2)
+            .min(track.height.saturating_sub(size.height));
+
+        Some(CommandTooltipFrame {
+            pixels: &self.tooltip_pixels,
+            size,
+            x,
+            y: y + TabBarController::physical_height(scale),
+            updated,
+        })
     }
 
     pub fn move_pointer(&mut self, position: LogicalPosition) -> ScrollbarPointerUpdate {
@@ -566,6 +679,7 @@ impl ScrollbarController {
             update.redraw |= update.scroll_delta != 0;
         }
 
+        update.redraw |= self.update_tooltip();
         update
     }
 
@@ -597,11 +711,14 @@ impl ScrollbarController {
         }
 
         update.pointer_cursor = hovered || self.dragging;
+        update.redraw |= self.update_tooltip();
         update
     }
 
     pub fn pointer_exited(&mut self) -> bool {
-        let redraw = self.hovered || self.dragging;
+        let redraw = self.hovered || self.dragging || self.tooltip_y.is_some();
+        self.tooltip_y = None;
+        self.cursor_position = LogicalPosition::new(-1., -1.);
         self.hovered = false;
         self.dragging = false;
         self.component.set_hovered(false);
@@ -622,7 +739,34 @@ impl ScrollbarController {
     }
 
     fn visible(&self) -> bool {
-        self.state.history_size > 0 && self.logical_size().height > 0.
+        (self.state.history_size > 0 || !self.command_marks.is_empty())
+            && self.logical_size().height > 0.
+    }
+
+    fn update_tooltip(&mut self) -> bool {
+        let mark = if !self.dragging && self.hit_track(self.cursor_position) {
+            let mouse_y = self.local_y(self.cursor_position) - COMMAND_MARK_HEIGHT / 2.;
+            self.command_marks
+                .iter()
+                .rev()
+                .filter(|(y, _)| (mouse_y - y).abs() <= COMMAND_MARK_HOVER_RADIUS)
+                .min_by(|(a, _), (b, _)| (mouse_y - a).abs().total_cmp(&(mouse_y - b).abs()))
+        } else {
+            None
+        };
+
+        let Some((mark_y, mark)) = mark else { return self.tooltip_y.take().is_some() };
+        let moved = self.tooltip_y.replace(*mark_y) != Some(*mark_y);
+        let label = mark.command.as_deref().unwrap_or(match mark.status {
+            Some(0) => "Command succeeded",
+            Some(_) => "Command failed",
+            None => "Command",
+        });
+        let changed = self.tooltip.get_label() != label;
+        if changed {
+            self.tooltip.set_label(label.into());
+        }
+        moved || changed
     }
 
     fn logical_size(&self) -> LogicalSize {
@@ -680,7 +824,7 @@ impl ScrollbarController {
 
     fn update_component_state(&self) {
         let (thumb_y, thumb_height) = self.thumb_geometry();
-        self.component.set_scrollbar_visible(self.visible());
+        self.component.set_scrollbar_visible(self.state.history_size > 0);
         self.component.set_thumb_y(thumb_y);
         self.component.set_thumb_height(thumb_height);
     }
@@ -835,6 +979,24 @@ mod tests {
 
         scrollbar.set_state(0, 40, 40);
         assert!(!scrollbar.render().4, "scrollbar should hide without scrollback");
+
+        let mark = CommandMark { command: Some("cargo check".into()), status: Some(0) };
+        scrollbar.set_command_marks([(Line(20), &mark)].into_iter());
+        assert!(scrollbar.render().4, "marks are visible before the buffer starts scrolling");
+        let mark_y = scrollbar.command_marks[0].0;
+        let position = LogicalPosition::new(795., TAB_BAR_HEIGHT + mark_y + 1.);
+        assert!(scrollbar.move_pointer(position).redraw);
+        assert_eq!(scrollbar.tooltip.get_label(), "cargo check");
+        let tooltip = scrollbar.render_tooltip().unwrap();
+        assert!(tooltip.updated);
+        assert!(tooltip.size.width < 400);
+        assert!(!scrollbar.move_pointer(position).redraw);
+        scrollbar.pointer_button(true);
+        assert!(scrollbar.render_tooltip().is_none(), "dragging hides the tooltip");
+        scrollbar.pointer_button(false);
+        assert!(scrollbar.render_tooltip().is_some());
+        scrollbar.pointer_exited();
+        assert!(scrollbar.render_tooltip().is_none());
     }
 
     fn click(tab_bar: &mut TabBarController, x: f32, y: f32) -> Option<TabBarAction> {

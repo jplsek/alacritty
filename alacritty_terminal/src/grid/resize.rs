@@ -50,6 +50,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // Need to resize before updating buffer.
         self.raw.grow_visible_lines(target);
         self.lines = target;
+        self.command_marks.shift(lines_added as i64);
 
         let history_size = self.history_size();
         let from_history = min(history_size, lines_added);
@@ -66,6 +67,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         self.display_offset = self.display_offset.saturating_sub(lines_added);
         self.decrease_scroll_limit(lines_added);
+        self.command_marks.discard_history_before(self.topmost_line());
     }
 
     /// Remove lines from the visible area.
@@ -95,6 +97,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.raw.rotate((self.lines - target) as isize);
         self.raw.shrink_visible_lines(target);
         self.lines = target;
+        self.command_marks.clear_region(Line(target as i32), Line(i32::MAX));
     }
 
     /// Grow number of columns in each row, reflowing if necessary.
@@ -117,8 +120,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
 
         let mut rows = self.raw.take_all();
+        let mut mark_rows = self.command_marks.reflow_map(rows.len());
 
         for (i, mut row) in rows.drain(..).enumerate().rev() {
+            if let Some(map) = &mut mark_rows {
+                map[i] = reversed.len();
+            }
             // Check if reflowing should be performed.
             let last_row = match reversed.last_mut() {
                 Some(last_row) if should_reflow(last_row) => last_row,
@@ -162,6 +169,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             };
 
             // Add removed cells to previous row and reflow content.
+            if !cells.is_empty()
+                && let Some(map) = &mut mark_rows
+            {
+                map[i] -= 1;
+            }
             last_row.append(&mut cells);
 
             let cursor_buffer_line = self.lines - self.cursor.point.line.0 as usize - 1;
@@ -236,6 +248,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
 
         self.raw.replace_inner(new_raw);
+        if let Some(map) = mark_rows {
+            self.command_marks.reflow(&map, self.lines, self.raw.len());
+        }
 
         // Clamp display offset in case lines above it got merged.
         self.display_offset = min(self.display_offset, self.history_size());
@@ -255,7 +270,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         let mut buffered: Option<Vec<T>> = None;
 
         let mut rows = self.raw.take_all();
+        let mut mark_rows = self.command_marks.reflow_map(rows.len());
         for (i, mut row) in rows.drain(..).enumerate().rev() {
+            if let Some(map) = &mut mark_rows {
+                map[i] = new_raw.len();
+            }
             // Append lines left over from the previous row.
             if let Some(buffered) = buffered.take() {
                 // Add a column for every cell added before the cursor, if it goes beyond the new
@@ -365,8 +384,15 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Reverse iterator and use it as the new grid storage.
         let mut reversed: Vec<Row<T>> = new_raw.drain(..).rev().collect();
+        let discarded = reversed.len().saturating_sub(self.max_scroll_limit + self.lines);
         reversed.truncate(self.max_scroll_limit + self.lines);
         self.raw.replace_inner(reversed);
+        if let Some(mut map) = mark_rows {
+            for row in &mut map {
+                *row = row.checked_sub(discarded).unwrap_or(usize::MAX);
+            }
+            self.command_marks.reflow(&map, self.lines, self.raw.len());
+        }
 
         // Clamp display offset in case some lines went off.
         self.display_offset = min(self.display_offset, self.history_size());

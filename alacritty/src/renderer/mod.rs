@@ -23,6 +23,7 @@ use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 use crate::renderer::tab_bar::TabBarRenderer;
+use crate::tab_bar::CommandTooltipFrame;
 
 pub mod platform;
 pub mod rects;
@@ -93,6 +94,7 @@ pub struct Renderer {
     rect_renderer: RectRenderer,
     tab_bar_renderer: TabBarRenderer,
     scrollbar_renderer: TabBarRenderer,
+    command_tooltip_renderer: TabBarRenderer,
     robustness: bool,
 }
 
@@ -154,20 +156,17 @@ impl Renderer {
             None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
-        let (text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer) = if use_glsl3 {
-            let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
-            let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
-            let tab_bar_renderer = TabBarRenderer::new(ShaderVersion::Glsl3)?;
-            let scrollbar_renderer = TabBarRenderer::new(ShaderVersion::Glsl3)?;
-            (text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer)
+        let (text_renderer, shader_version) = if use_glsl3 {
+            (TextRendererProvider::Glsl3(Glsl3Renderer::new()?), ShaderVersion::Glsl3)
         } else {
             let text_renderer =
                 TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?);
-            let rect_renderer = RectRenderer::new(ShaderVersion::Gles2)?;
-            let tab_bar_renderer = TabBarRenderer::new(ShaderVersion::Gles2)?;
-            let scrollbar_renderer = TabBarRenderer::new(ShaderVersion::Gles2)?;
-            (text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer)
+            (text_renderer, ShaderVersion::Gles2)
         };
+        let rect_renderer = RectRenderer::new(shader_version)?;
+        let tab_bar_renderer = TabBarRenderer::new(shader_version)?;
+        let scrollbar_renderer = TabBarRenderer::new(shader_version)?;
+        let command_tooltip_renderer = TabBarRenderer::new(shader_version)?;
 
         // Enable debug logging for OpenGL as well.
         if log::max_level() >= LevelFilter::Debug && GlExtensions::contains("GL_KHR_debug") {
@@ -179,7 +178,14 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, tab_bar_renderer, scrollbar_renderer, robustness })
+        Ok(Self {
+            text_renderer,
+            rect_renderer,
+            tab_bar_renderer,
+            scrollbar_renderer,
+            command_tooltip_renderer,
+            robustness,
+        })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -316,6 +322,24 @@ impl Renderer {
             x,
             tab_bar_height,
             updated,
+        );
+    }
+
+    pub fn draw_command_tooltip(
+        &mut self,
+        tooltip: CommandTooltipFrame<'_>,
+        surface_width: u32,
+        surface_height: u32,
+    ) {
+        self.command_tooltip_renderer.draw_rgba(
+            tooltip.pixels,
+            tooltip.size.width,
+            tooltip.size.height,
+            surface_width,
+            surface_height,
+            tooltip.x,
+            tooltip.y,
+            tooltip.updated,
         );
     }
 

@@ -2,6 +2,7 @@
 
 use std::cmp::{max, min};
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
+use std::sync::Arc;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -10,12 +11,15 @@ use crate::index::{Column, Line, Point};
 use crate::term::cell::{Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
+mod commands;
 pub mod resize;
 mod row;
 mod storage;
 #[cfg(test)]
 mod tests;
 
+pub use self::commands::CommandMark;
+use self::commands::CommandMarks;
 pub use self::row::Row;
 use self::storage::Storage;
 
@@ -135,6 +139,9 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    #[cfg_attr(feature = "serde", serde(skip))]
+    command_marks: CommandMarks,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,6 +154,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            command_marks: Default::default(),
         }
     }
 
@@ -158,6 +166,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
         self.display_offset = min(self.display_offset, history_size);
         self.max_scroll_limit = history_size;
+        self.command_marks.discard_history_before(Line(-(history_size as i32)));
     }
 
     pub fn scroll_display(&mut self, scroll: Scroll) {
@@ -193,6 +202,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.command_marks.scroll_region(region, positions as i64, false);
+
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -254,6 +265,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        if region.start == Line(0) && region.end.0 as usize == self.lines {
+            self.command_marks.shift(-(positions as i64));
+        } else {
+            self.command_marks.scroll_region(region, -(positions as i64), region.start == Line(0));
+        }
+
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -304,6 +321,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
             self.raw[i].reset(&self.cursor.template);
         }
+        self.command_marks.discard_history_before(self.topmost_line());
     }
 
     pub fn clear_viewport<D>(&mut self)
@@ -325,6 +343,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Clear the viewport.
         self.scroll_up(&region, positions);
+        self.command_marks.clear_region(Line(0), region.end);
 
         // Reset rotated lines.
         for line in (0..(self.lines - positions)).map(Line::from) {
@@ -339,6 +358,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         D: PartialEq,
     {
         self.clear_history();
+        self.command_marks = CommandMarks::default();
 
         self.saved_cursor = Cursor::default();
         self.cursor = Cursor::default();
@@ -353,6 +373,21 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 }
 
 impl<T> Grid<T> {
+    /// Marks within the live scrollback or visible terminal.
+    pub fn command_marks(&self) -> impl Iterator<Item = (Line, &CommandMark)> + Clone {
+        let top = self.topmost_line();
+        let bottom = self.bottommost_line();
+        self.command_marks.iter().filter(move |(line, _)| *line >= top && *line <= bottom)
+    }
+
+    pub(crate) fn start_command(&mut self, command: Option<Arc<str>>) {
+        self.command_marks.start(self.cursor.point.line, command);
+    }
+
+    pub(crate) fn finish_command(&mut self, status: i32) {
+        self.command_marks.finish(status);
+    }
+
     /// Reset a visible region within the grid.
     pub fn reset_region<D, R: RangeBounds<Line>>(&mut self, bounds: R)
     where
@@ -373,6 +408,7 @@ impl<T> Grid<T> {
 
         debug_assert!(start < self.screen_lines() as i32);
         debug_assert!(end <= self.screen_lines() as i32);
+        self.command_marks.clear_region(start, end);
 
         for line in (start.0..end.0).map(Line::from) {
             self.raw[line].reset(&self.cursor.template);
@@ -383,6 +419,7 @@ impl<T> Grid<T> {
     pub fn clear_history(&mut self) {
         // Explicitly purge all lines from history.
         self.raw.shrink_lines(self.history_size());
+        self.command_marks.clear_region(Line(i32::MIN), Line(0));
 
         // Reset display offset.
         self.display_offset = 0;

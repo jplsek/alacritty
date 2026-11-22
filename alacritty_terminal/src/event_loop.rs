@@ -16,7 +16,7 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::event::{self, Event, EventListener, WindowSize};
 use crate::sync::FairMutex;
-use crate::term::Term;
+use crate::term::{Term, TermMode};
 use crate::{thread, tty};
 use vte::ansi;
 
@@ -112,7 +112,7 @@ where
     {
         let mut unprocessed = 0;
         let mut processed = 0;
-        let mut command_status = CommandStatus::default();
+        let mut command_status = None;
 
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
@@ -152,8 +152,7 @@ where
             }
 
             // Parse the incoming bytes.
-            state.shell_parser.advance(&mut command_status, &buf[..unprocessed]);
-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            state.advance(terminal, &buf[..unprocessed], &mut command_status);
 
             processed += unprocessed;
             unprocessed = 0;
@@ -164,7 +163,7 @@ where
             }
         }
 
-        if let Some(status) = command_status.0 {
+        if let Some(status) = command_status {
             self.event_proxy.send_event(Event::CommandFinished(status));
         }
 
@@ -408,44 +407,159 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
-    // The ANSI processor does not expose unknown OSC sequences. Observe OSC 133 with the raw
-    // parser while leaving the main ANSI path and its synchronized updates intact.
+    // The ANSI processor does not expose unknown OSC sequences. Observe shell markers with the
+    // raw parser and advance the main parser to each marker before reading the cursor position.
     shell_parser: vte::Parser,
+    command_line: Option<Arc<str>>,
+}
+
+enum ShellMarker {
+    CommandLine(Arc<str>),
+    Start,
+    Finish(i32),
 }
 
 #[derive(Default)]
-struct CommandStatus(Option<i32>);
+struct ShellMarkerParser(Option<ShellMarker>);
 
-impl vte::Perform for CommandStatus {
+impl vte::Perform for ShellMarkerParser {
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if let [b"133", b"D", status, ..] = params
-            && let Ok(status) = std::str::from_utf8(status)
-            && let Ok(status) = status.parse()
-        {
-            self.0 = Some(status);
+        self.0 = match params {
+            [b"633", b"E", text, ..] => Some(ShellMarker::CommandLine(decode_command_line(text))),
+            [b"133" | b"633", b"C", ..] => Some(ShellMarker::Start),
+            [b"133" | b"633", b"D", status, ..] => std::str::from_utf8(status)
+                .ok()
+                .and_then(|status| status.parse().ok())
+                .map(ShellMarker::Finish),
+            _ => None,
+        };
+    }
+
+    fn terminated(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+fn decode_command_line(mut text: &[u8]) -> Arc<str> {
+    const MAX_LABEL_BYTES: usize = 512;
+    let mut bytes = Vec::with_capacity(text.len().min(MAX_LABEL_BYTES));
+    while !text.is_empty() && bytes.len() < MAX_LABEL_BYTES {
+        match text {
+            [b'\\', b'\\', tail @ ..] => {
+                bytes.push(b'\\');
+                text = tail;
+            },
+            [b'\\', b'x', hi, lo, tail @ ..] => {
+                if let (Some(hi), Some(lo)) =
+                    ((*hi as char).to_digit(16), (*lo as char).to_digit(16))
+                {
+                    bytes.push((hi * 16 + lo) as u8);
+                    text = tail;
+                } else {
+                    bytes.push(b'\\');
+                    text = &text[1..];
+                }
+            },
+            [byte, tail @ ..] => {
+                bytes.push(*byte);
+                text = tail;
+            },
+            [] => break,
         }
     }
+    let text: String = String::from_utf8_lossy(&bytes)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    Arc::from(text.trim())
 }
 
 #[cfg(test)]
 #[test]
 fn shell_command_completion_requires_an_exit_status() {
     let mut parser = vte::Parser::new();
-    let mut status = CommandStatus::default();
+    let mut marker = ShellMarkerParser::default();
 
-    parser.advance(&mut status, b"\x1b]133;A\x07\x1b]133;D\x07\x1b]133;D;invalid\x07");
-    assert_eq!(status.0, None);
+    parser.advance(&mut marker, b"\x1b]133;A\x07\x1b]133;D\x07\x1b]133;D;invalid\x07");
+    assert!(marker.0.is_none());
 
-    parser.advance(&mut status, b"\x1b]133;D;");
-    assert_eq!(status.0, None);
-    parser.advance(&mut status, b"42\x07");
-    assert_eq!(status.0, Some(42));
+    parser.advance(&mut marker, b"\x1b]133;D;");
+    assert!(marker.0.is_none());
+    parser.advance(&mut marker, b"42\x07");
+    assert!(matches!(marker.0.take(), Some(ShellMarker::Finish(42))));
 
-    parser.advance(&mut status, b"\x1b]133;D;0\x1b\\");
-    assert_eq!(status.0, Some(0));
+    parser.advance(&mut marker, b"\x1b]133;D;0\x1b\\");
+    assert!(matches!(marker.0.take(), Some(ShellMarker::Finish(0))));
+}
+
+#[cfg(test)]
+#[test]
+fn command_marks_keep_the_command_row_as_output_scrolls_and_reflows() {
+    use crate::event::VoidListener;
+    use crate::index::{Column, Line};
+    use crate::term::{Config, test::TermSize};
+
+    let mut term = Term::new(Config::default(), &TermSize::new(20, 4), VoidListener);
+    let mut state = State::default();
+    let mut status = None;
+    state.advance(
+        &mut term,
+        b"\r\n\x1b]633;E;one\\x3b two\\\\three\x07\x1b]133;C\x07output\r\n\r\n\r\n\r\n\x1b]133;D;7\x07",
+        &mut status,
+    );
+
+    let (line, mark) = term.grid().command_marks().next().unwrap();
+    assert_eq!(line, Line(-1));
+    assert_eq!(mark.command.as_deref(), Some("one; two\\three"));
+    assert_eq!(mark.status, Some(7));
+    assert_eq!(status, Some(7));
+
+    for size in [TermSize::new(4, 4), TermSize::new(20, 4), TermSize::new(20, 5)] {
+        term.resize(size);
+        let (line, _) = term.grid().command_marks().next().unwrap();
+        assert_eq!(term.grid()[line][Column(0)].c, 'o');
+    }
+    term.grid_mut().clear_history();
+    let (line, _) = term.grid().command_marks().next().unwrap();
+    assert_eq!(line, Line(0), "clearing scrollback keeps visible marks");
+    term.grid_mut().reset_region(..);
+    assert!(term.grid().command_marks().next().is_none());
 }
 
 impl State {
+    fn advance<T: EventListener>(
+        &mut self,
+        terminal: &mut Term<T>,
+        mut bytes: &[u8],
+        command_status: &mut Option<i32>,
+    ) {
+        let mut observer = ShellMarkerParser::default();
+        while !bytes.is_empty() {
+            let end = self.shell_parser.advance_until_terminated(&mut observer, bytes);
+            self.parser.advance(terminal, &bytes[..end]);
+            bytes = &bytes[end..];
+
+            let primary = !terminal.mode().contains(TermMode::ALT_SCREEN);
+            match observer.0.take() {
+                Some(ShellMarker::CommandLine(command)) => self.command_line = Some(command),
+                Some(ShellMarker::Start) => {
+                    let command = self.command_line.take().filter(|command| !command.is_empty());
+                    if primary {
+                        terminal.grid_mut().start_command(command);
+                    }
+                },
+                Some(ShellMarker::Finish(status)) => {
+                    self.command_line = None;
+                    if primary {
+                        terminal.grid_mut().finish_command(status);
+                    }
+                    *command_status = Some(status);
+                },
+                None => (),
+            }
+        }
+    }
+
     #[inline]
     fn ensure_next(&mut self) {
         if self.writing.is_none() {

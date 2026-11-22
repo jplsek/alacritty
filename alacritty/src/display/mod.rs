@@ -796,6 +796,7 @@ impl Display {
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
         scrollbar.set_state(display_offset, total_lines, terminal.screen_lines());
+        scrollbar.set_command_marks(terminal.grid().command_marks());
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
 
@@ -1038,6 +1039,13 @@ impl Display {
                 self.surface_size.height,
                 tab_height,
                 scrollbar_updated,
+            );
+        }
+        if let Some(tooltip) = scrollbar.render_tooltip() {
+            self.renderer.draw_command_tooltip(
+                tooltip,
+                self.surface_size.width,
+                self.surface_size.height,
             );
         }
         self.renderer.resize(&self.size_info);

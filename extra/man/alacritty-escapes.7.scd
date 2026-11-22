@@ -256,7 +256,10 @@ brevity.
 :[
 |  _OSC 133_
 :  Partial
-:[ Only *D* with an explicit exit status is supported, for background tab indicators
+:[ *C* starts a scrollbar mark; *D* with a status updates it and the background tab indicator
+|  _OSC 633_
+:  Partial
+:[ *E* supplies command text; *C* and *D* are equivalent to their OSC 133 forms
 
 ## Background tab status
 
@@ -268,6 +271,13 @@ select the tab to clear the dot.
 Enable shell integration that emits the command completion marker. For zsh,
 source _extra/shell-integration/alacritty.zsh_ from the Alacritty checkout in
 your _.zshrc_.
+
+## Scrollbar command marks
+
+*OSC 133 ; C ST* starts a mark at the command's position in the terminal buffer.
+The completion marker colors it by exit status. Hover over a mark to see the
+command text when the shell sends *OSC 633 ; E ; command ST* before the start
+marker. The included zsh hook sends both.
 
 # DCS (Device Control String) - ESC P
 
