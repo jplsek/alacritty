@@ -499,6 +499,91 @@ impl ApplicationHandler<Event> for Processor {
 
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
+            #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+            (EventType::IpcUiDebug(action, stream), window_id) => {
+                let window_id = window_id.copied().or_else(|| {
+                    (self.windows.len() == 1).then(|| *self.windows.keys().next().unwrap())
+                });
+                let result = match window_id.and_then(|id| self.windows.get_mut(&id)) {
+                    Some(window) => {
+                        // Drain pending native/input events through the normal dispatch path.
+                        window.handle_event(
+                            #[cfg(target_os = "macos")]
+                            event_loop,
+                            &self.proxy,
+                            &mut self.clipboard,
+                            &mut self.scheduler,
+                            WinitEvent::AboutToWait,
+                        );
+
+                        let result = match action {
+                            crate::ui_debug::UiDebugAction::CreateTab => window
+                                .handle_tab_action(
+                                    TabAction::Create(WindowOptions::default()),
+                                    self.config.clone(),
+                                    self.proxy.clone(),
+                                    &mut self.scheduler,
+                                    &self.global_ipc_options,
+                                )
+                                .map(|_| ())
+                                .map_err(|err| err.to_string()),
+                            crate::ui_debug::UiDebugAction::Resize { width, height } => {
+                                if width == 0 || height == 0 {
+                                    Err(String::from("resize dimensions must be nonzero"))
+                                } else {
+                                    // Wayland can apply the size synchronously without emitting
+                                    // Resized. Dispatch the returned size through normal handling.
+                                    let size = winit::dpi::PhysicalSize::new(width, height);
+                                    if let Some(size) =
+                                        window.display.window.request_inner_size(size)
+                                    {
+                                        window.handle_event(
+                                            #[cfg(target_os = "macos")]
+                                            event_loop,
+                                            &self.proxy,
+                                            &mut self.clipboard,
+                                            &mut self.scheduler,
+                                            WinitEvent::WindowEvent {
+                                                window_id: window.id(),
+                                                event: WindowEvent::Resized(size),
+                                            },
+                                        );
+                                    }
+                                    Ok(())
+                                }
+                            },
+                            crate::ui_debug::UiDebugAction::Redraw => {
+                                if window.ui_debug_state().occluded {
+                                    Err(String::from("cannot redraw an occluded window"))
+                                } else {
+                                    window.handle_event(
+                                        #[cfg(target_os = "macos")]
+                                        event_loop,
+                                        &self.proxy,
+                                        &mut self.clipboard,
+                                        &mut self.scheduler,
+                                        WinitEvent::WindowEvent {
+                                            window_id: window.id(),
+                                            event: WindowEvent::RedrawRequested,
+                                        },
+                                    );
+                                    window.draw(&mut self.scheduler);
+                                    Ok(())
+                                }
+                            },
+                            action => window.ui_debug_action(action),
+                        };
+                        result.map(|()| window.ui_debug_state())
+                    },
+                    None => Err(format!(
+                        "specify --window-id for one of the open windows: {:?}",
+                        self.windows.keys().map(|id| u64::from(*id)).collect::<Vec<_>>()
+                    )),
+                };
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, SocketReply::UiDebug(result));
+                }
+            },
             // Process IPC config update.
             #[cfg(unix)]
             (EventType::IpcConfig(ipc_config), window_id) => {
@@ -823,6 +908,8 @@ pub enum EventType {
     IpcConfig(IpcConfig),
     #[cfg(unix)]
     IpcGetConfig(Arc<UnixStream>),
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    IpcUiDebug(crate::ui_debug::UiDebugAction, Arc<UnixStream>),
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
@@ -2263,6 +2350,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 },
                 #[cfg(unix)]
                 EventType::IpcConfig(_) | EventType::IpcGetConfig(..) | EventType::Shutdown => (),
+                #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+                EventType::IpcUiDebug(..) => (),
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)

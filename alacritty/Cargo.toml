@@ -108,3 +108,5 @@ wayland = [
     "winit/wayland-csd-adwaita",
 ]
 nightly = []
+# Local UI automation, compiled only with debug assertions on Unix.
+ui-debug = []

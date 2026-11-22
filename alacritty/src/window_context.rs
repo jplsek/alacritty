@@ -249,6 +249,8 @@ pub struct WindowContext {
     occluded: bool,
     focused: bool,
     pub(crate) closing: bool,
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    rendered_frames: u64,
 }
 
 impl WindowContext {
@@ -358,7 +360,7 @@ impl WindowContext {
         )?;
 
         if let Some(size) = requested_size {
-            window.request_inner_size(size);
+            let _ = window.request_inner_size(size);
         }
 
         let raw_window_handle = window.raw_window_handle();
@@ -417,6 +419,8 @@ impl WindowContext {
             focused: true,
             closing: false,
             dirty: true,
+            #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+            rendered_frames: 0,
         };
         window_context.sync_tab_bar();
         if moved_between_windows {
@@ -626,6 +630,98 @@ impl WindowContext {
             &mut self.tab_bar,
             &mut self.scrollbar,
         );
+        #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+        {
+            self.rendered_frames += 1;
+        }
+    }
+
+    /// Apply debug commands without duplicating tab activation or resize handling.
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    pub(crate) fn ui_debug_action(
+        &mut self,
+        action: crate::ui_debug::UiDebugAction,
+    ) -> Result<(), String> {
+        use crate::ui_debug::UiDebugAction;
+
+        match action {
+            UiDebugAction::State => (),
+            UiDebugAction::SelectTab { index } => {
+                if index >= self.tabs.len() {
+                    return Err(format!(
+                        "tab index {index} out of range ({} tabs)",
+                        self.tabs.len()
+                    ));
+                }
+                self.select_tab(index);
+            },
+            UiDebugAction::Output { data } => {
+                let mut terminal = self.tabs[self.active_tab].terminal.lock();
+                let mut parser = alacritty_terminal::vte::ansi::Processor::<
+                    alacritty_terminal::vte::ansi::StdSyncHandler,
+                >::new();
+                parser.advance(&mut *terminal, data.as_bytes());
+                self.dirty = true;
+                self.display.window.request_redraw();
+            },
+            UiDebugAction::CreateTab | UiDebugAction::Resize { .. } | UiDebugAction::Redraw => {
+                unreachable!("handled by the application event loop")
+            },
+        }
+
+        Ok(())
+    }
+
+    /// Snapshot the real terminal grids without synchronizing or repairing their geometry.
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    pub(crate) fn ui_debug_state(&self) -> crate::ui_debug::WindowState {
+        use crate::ui_debug::{TabState, WindowState};
+        use alacritty_terminal::index::{Column, Line};
+
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let terminal = tab.terminal.lock();
+                let cursor = terminal.grid().cursor.point;
+                TabState {
+                    id: tab.id.0,
+                    title: tab.title.clone(),
+                    columns: terminal.columns(),
+                    screen_lines: terminal.screen_lines(),
+                    cursor_line: cursor.line.0,
+                    cursor_column: cursor.column.0,
+                    queued_events: tab.event_queue.len(),
+                }
+            })
+            .collect();
+        let terminal = self.tabs[self.active_tab].terminal.lock();
+        let offset = terminal.grid().display_offset() as i32;
+        let text = (0..terminal.screen_lines())
+            .map(|row| {
+                let line = Line(row as i32 - offset);
+                let text: String = (0..terminal.columns())
+                    .map(|col| terminal.grid()[line][Column(col)].c)
+                    .collect();
+                text.trim_end().to_owned()
+            })
+            .collect();
+        let size = self.display.window.inner_size();
+        let surface_size = self.display.ui_debug_surface_size();
+        WindowState {
+            window_id: self.id().into(),
+            active_tab: self.active_tab,
+            native_width: size.width,
+            native_height: size.height,
+            surface_width: surface_size.width,
+            surface_height: surface_size.height,
+            columns: self.display.size_info.columns(),
+            screen_lines: self.display.size_info.screen_lines(),
+            rendered_frames: self.rendered_frames,
+            occluded: self.occluded,
+            tabs,
+            text,
+        }
     }
 
     /// Process events for this terminal window.

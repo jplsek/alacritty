@@ -85,6 +85,12 @@ impl IpcListener {
                 let event = Event::new(EventType::IpcGetConfig(Arc::new(stream)), window_id);
                 let _ = self.event_proxy.send_event(event);
             },
+            #[cfg(all(feature = "ui-debug", debug_assertions))]
+            SocketMessage::UiDebug(options) => {
+                let window_id = options.window_id.map(WindowId::from);
+                let payload = EventType::IpcUiDebug(options.action, Arc::new(stream));
+                let _ = self.event_proxy.send_event(Event::new(payload, window_id));
+            },
         }
 
         Ok(())
@@ -111,6 +117,20 @@ pub fn send_message(socket: Option<PathBuf>, message: SocketMessage) -> IoResult
 
 /// Process IPC responses.
 fn handle_reply(stream: &UnixStream, message: &SocketMessage) -> IoResult<()> {
+    #[cfg(all(feature = "ui-debug", debug_assertions))]
+    if matches!(message, SocketMessage::UiDebug(_)) {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let reply: SocketReply = serde_json::from_reader(BufReader::new(stream))?;
+        return match reply {
+            SocketReply::UiDebug(Ok(state)) => {
+                println!("{}", serde_json::to_string(&state)?);
+                Ok(())
+            },
+            SocketReply::UiDebug(Err(err)) => Err(IoError::other(err)),
+            _ => Err(IoError::other("unexpected UI debug reply")),
+        };
+    }
+
     // Read reply, returning early if there is none.
     let mut buffer = String::new();
     let mut reader = BufReader::new(stream);
@@ -235,4 +255,6 @@ pub fn socket_prefix() -> String {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SocketReply {
     GetConfig(String),
+    #[cfg(all(feature = "ui-debug", debug_assertions))]
+    UiDebug(Result<crate::ui_debug::WindowState, String>),
 }

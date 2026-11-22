@@ -49,6 +49,8 @@ mod scheduler;
 mod session;
 mod string;
 mod tab_bar;
+#[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+mod ui_debug;
 mod window_context;
 
 mod gl {

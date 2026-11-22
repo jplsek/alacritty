@@ -249,8 +249,8 @@ impl Window {
     }
 
     #[inline]
-    pub fn request_inner_size(&self, size: PhysicalSize<u32>) {
-        let _ = self.window.request_inner_size(size);
+    pub fn request_inner_size(&self, size: PhysicalSize<u32>) -> Option<PhysicalSize<u32>> {
+        self.window.request_inner_size(size)
     }
 
     #[inline]

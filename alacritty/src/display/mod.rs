@@ -403,6 +403,12 @@ pub struct Display {
 }
 
 impl Display {
+    /// Surface geometry committed by the normal resize handler.
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    pub(crate) fn ui_debug_surface_size(&self) -> PhysicalSize<u32> {
+        self.surface_size
+    }
+
     pub fn new(
         window: Window,
         gl_context: NotCurrentContext,
@@ -425,7 +431,7 @@ impl Display {
         // Resize the window to account for the user configured size.
         if let Some(dimensions) = config.window.dimensions() {
             let size = window_size(config, dimensions, cell_width, cell_height, scale_factor);
-            window.request_inner_size(size);
+            let _ = window.request_inner_size(size);
         }
 
         // Create the GL surface to draw into.

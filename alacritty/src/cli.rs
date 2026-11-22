@@ -263,6 +263,11 @@ pub enum SocketMessage {
 
     /// Read runtime Alacritty configuration.
     GetConfig(IpcGetConfig),
+
+    /// Inspect and drive the UI in an opt-in development build.
+    #[cfg(all(feature = "ui-debug", debug_assertions))]
+    #[clap(hide = true)]
+    UiDebug(crate::ui_debug::UiDebugOptions),
 }
 
 /// Migrate the configuration file.
@@ -536,6 +541,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(
+        all(feature = "ui-debug", debug_assertions),
+        ignore = "completion snapshots describe the normal CLI; run without ui-debug"
+    )]
     fn completions() {
         let mut clap = Options::command();
 
