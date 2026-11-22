@@ -707,19 +707,13 @@ impl Display {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
-        // Resize when terminal when its dimensions have changed.
-        if self.size_info.screen_lines() != new_size.screen_lines
-            || self.size_info.columns() != new_size.columns()
-        {
-            // Resize PTY.
-            pty_resize_handle.on_resize(new_size.into());
-
-            // Resize terminal.
-            terminal.resize(new_size);
-
-            // Resize damage tracking.
-            self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
-        }
+        Self::update_terminal_geometry(
+            terminal,
+            pty_resize_handle,
+            &mut self.damage_tracker,
+            self.size_info,
+            new_size,
+        );
 
         // Check if dimensions have changed.
         if new_size != self.size_info || surface_size != self.surface_size {
@@ -732,6 +726,30 @@ impl Display {
         }
         self.size_info = new_size;
         self.surface_size = surface_size;
+    }
+
+    fn update_terminal_geometry<T: EventListener>(
+        terminal: &mut Term<T>,
+        pty_resize_handle: &mut dyn OnResize,
+        damage_tracker: &mut DamageTracker,
+        old_size: SizeInfo,
+        new_size: SizeInfo,
+    ) {
+        // An inactive tab may still have the geometry from before the window was resized.
+        // Synchronize its grid independently of the shared display's current dimensions.
+        if terminal.screen_lines() != new_size.screen_lines()
+            || terminal.columns() != new_size.columns()
+        {
+            pty_resize_handle.on_resize(new_size.into());
+            terminal.resize(new_size);
+        }
+
+        // Resize shared damage tracking only when the display's dimensions have changed.
+        if old_size.screen_lines() != new_size.screen_lines()
+            || old_size.columns() != new_size.columns()
+        {
+            damage_tracker.resize(new_size.screen_lines(), new_size.columns());
+        }
     }
 
     // NOTE: Renderer updates are split off, since platforms like Wayland require resize and other
@@ -1669,4 +1687,97 @@ fn window_size(
     let height = (padding.1).mul_add(2., grid_height).floor() + tab_bar_height;
 
     PhysicalSize::new(width as u32, height as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct PtyResizeRecorder(Vec<WindowSize>);
+
+    impl OnResize for PtyResizeRecorder {
+        fn on_resize(&mut self, size: WindowSize) {
+            self.0.push(size);
+        }
+    }
+
+    #[test]
+    fn activate_stale_terminal_then_partially_redraw() {
+        let tall = SizeInfo::new(800., 400., 10., 10., 0., 0., false);
+        let short = SizeInfo::new(800., 220., 10., 10., 0., 0., false);
+        let mut inactive = Term::new(Default::default(), &tall, VoidListener);
+        let mut active = Term::new(Default::default(), &tall, VoidListener);
+        let mut damage = DamageTracker::new(tall.screen_lines(), tall.columns());
+        let mut pty = PtyResizeRecorder::default();
+        let mut parser: Processor = Processor::new();
+
+        // Leave the inactive terminal's cursor on row 39 with only partial damage.
+        parser.advance(&mut inactive, b"\x1b[40;1H");
+        inactive.reset_damage();
+        parser.advance(&mut inactive, b".\x08");
+
+        // The native resize updates the active tab and the shared display only.
+        Display::update_terminal_geometry(&mut active, &mut pty, &mut damage, tall, short);
+        assert_eq!(active.screen_lines(), 22);
+        assert_eq!(inactive.screen_lines(), 40);
+        damage.swap_damage();
+        damage.swap_damage();
+        pty.0.clear();
+
+        // Activation must synchronize the stale grid without another native resize event.
+        damage.invalidate();
+        Display::update_terminal_geometry(&mut inactive, &mut pty, &mut damage, short, short);
+        assert_eq!(inactive.screen_lines(), 22);
+        assert_eq!(inactive.columns(), 80);
+        assert_eq!(pty.0.len(), 1);
+        assert_eq!(pty.0[0].num_lines, 22);
+        assert_eq!(pty.0[0].num_cols, 80);
+
+        // A resize fully damages the first frame. Exercise the later partial redraw as well,
+        // since scrolling or stopping after the full redraw would hide the original crash.
+        assert!(matches!(inactive.damage(), TermDamage::Full));
+        inactive.reset_damage();
+        damage.swap_damage();
+        damage.swap_damage();
+        parser.advance(&mut inactive, b".\x08");
+        let TermDamage::Partial(lines) = inactive.damage() else {
+            panic!("expected partial damage after activation");
+        };
+        let mut damaged_lines = 0;
+        for line in lines {
+            assert!(line.line < short.screen_lines());
+            damage.frame().damage_line(line);
+            damaged_lines += 1;
+        }
+        assert!(damaged_lines > 0);
+        assert!(!damage.shape_frame_damage(short.into()).is_empty());
+    }
+
+    #[test]
+    fn synchronize_columns_without_resizing_display_damage() {
+        let wide = SizeInfo::new(800., 220., 10., 10., 0., 0., false);
+        let narrow = SizeInfo::new(400., 220., 10., 10., 0., 0., false);
+        let mut terminal = Term::new(Default::default(), &wide, VoidListener);
+        let mut damage = DamageTracker::new(narrow.screen_lines(), narrow.columns());
+        let mut pty = PtyResizeRecorder::default();
+        damage.swap_damage();
+        damage.swap_damage();
+        damage.frame().damage_line(LineDamageBounds::new(3, 1, 2));
+        let previous_damage = damage.shape_frame_damage(narrow.into());
+
+        Display::update_terminal_geometry(&mut terminal, &mut pty, &mut damage, narrow, narrow);
+        assert_eq!(terminal.columns(), 40);
+        assert_eq!(pty.0.len(), 1);
+        assert_eq!(pty.0[0].num_cols, 40);
+        assert_eq!(damage.shape_frame_damage(narrow.into()), previous_damage);
+
+        // Matching grid dimensions need neither another PTY resize nor a damage reset.
+        Display::update_terminal_geometry(&mut terminal, &mut pty, &mut damage, narrow, narrow);
+        assert_eq!(pty.0.len(), 1);
+        assert_eq!(damage.shape_frame_damage(narrow.into()), previous_damage);
+    }
 }

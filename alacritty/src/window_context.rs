@@ -1190,6 +1190,9 @@ impl WindowContext {
 
         let config = self.tabs[self.active_tab].config.clone();
         self.apply_display_config(old_config, &config);
+        // A different terminal replaces the entire viewport, even at identical dimensions.
+        self.display.damage_tracker.invalidate();
+        self.flush_active_display_update();
         self.display.window.set_title(self.tabs[self.active_tab].title.clone());
         let window_id = self.id();
         let tab_id = self.tabs[self.active_tab].id;
@@ -1231,7 +1234,7 @@ impl WindowContext {
         );
     }
 
-    /// Apply pending display geometry to the active terminal before processing its input queue.
+    /// Apply pending display geometry before rendering or processing the active tab's input queue.
     fn flush_active_display_update(&mut self) {
         if !self.display.pending_update.dirty {
             return;

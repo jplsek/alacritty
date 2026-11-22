@@ -66,10 +66,17 @@ impl DamageTracker {
     pub fn resize(&mut self, screen_lines: usize, columns: usize) {
         self.screen_lines = screen_lines;
         self.columns = columns;
+        self.invalidate();
+    }
+
+    /// Discard damage and cached positions when the displayed terminal changes.
+    pub fn invalidate(&mut self) {
+        self.old_vi_cursor = None;
+        self.old_selection = None;
         for frame in &mut self.frames {
-            frame.reset(screen_lines, columns);
+            frame.reset(self.screen_lines, self.columns);
+            frame.mark_fully_damaged();
         }
-        self.frame().full = true;
     }
 
     /// Damage vi cursor inside the viewport.
@@ -301,6 +308,64 @@ fn merge_rects(lhs: Rect, rhs: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::index::{Column, Line};
+
+    #[test]
+    fn invalidate_damage_when_switching_tabs_at_same_size() {
+        let mut tracker = DamageTracker::new(22, 80);
+        tracker.swap_damage();
+        tracker.swap_damage();
+        tracker.old_vi_cursor = Some(Point::new(21, Column(79)));
+        tracker.old_selection = Some(SelectionRange::new(
+            Point::new(Line(20), Column(0)),
+            Point::new(Line(21), Column(79)),
+            false,
+        ));
+        tracker.frame().damage_line(LineDamageBounds::new(21, 10, 20));
+        tracker.next_frame().rects.push(Rect::new(1, 2, 3, 4));
+
+        tracker.invalidate();
+
+        assert_eq!(tracker.old_vi_cursor, None);
+        assert_eq!(tracker.old_selection, None);
+        for frame in &tracker.frames {
+            assert!(frame.full);
+            assert!(frame.rects.is_empty());
+            assert_eq!(frame.lines.len(), 22);
+            assert!(frame.lines.iter().all(|line| !line.is_damaged()));
+        }
+
+        // Both retained frames must repaint the new tab, then resume partial damage.
+        tracker.damage_vi_cursor(Some(Point::new(0, Column(0))));
+        tracker.damage_selection(None, 0);
+        tracker.swap_damage();
+        assert!(tracker.frame().full);
+        tracker.swap_damage();
+        assert!(!tracker.frame().full);
+        tracker.damage_vi_cursor(None);
+        assert!(tracker.frame().lines[0].is_damaged());
+        assert!(!tracker.frame().lines[21].is_damaged());
+    }
+
+    #[test]
+    fn resize_discards_cached_positions_outside_new_viewport() {
+        let mut tracker = DamageTracker::new(40, 80);
+        tracker.old_vi_cursor = Some(Point::new(39, Column(79)));
+        tracker.old_selection = Some(SelectionRange::new(
+            Point::new(Line(39), Column(0)),
+            Point::new(Line(39), Column(79)),
+            false,
+        ));
+
+        tracker.resize(22, 40);
+        assert_eq!(tracker.old_vi_cursor, None);
+        assert_eq!(tracker.old_selection, None);
+        tracker.swap_damage();
+        tracker.swap_damage();
+        tracker.damage_vi_cursor(Some(Point::new(21, Column(39))));
+        tracker.damage_selection(None, 0);
+        assert!(tracker.frame().lines[21].is_damaged());
+    }
 
     #[test]
     fn damage_rect_math() {
