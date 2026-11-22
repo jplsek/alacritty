@@ -802,17 +802,22 @@ impl WindowContext {
                 let scrollbar_update = self.scrollbar.move_pointer(logical_position);
                 let tab_captured = tab_update.captured;
                 let scrollbar_captured = scrollbar_update.captured;
-                let cursor = if tab_update.pointer_cursor || scrollbar_update.pointer_cursor {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                };
+                let ui_captured = position.y < tab_height || tab_captured || scrollbar_captured;
+                let cursor = ui_captured.then_some(
+                    if tab_update.pointer_cursor || scrollbar_update.pointer_cursor {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Default
+                    },
+                );
                 self.display.window.set_mouse_visible(true);
-                self.display.window.set_mouse_cursor(cursor);
+                // Terminal input owns the cursor outside the tab bar and scrollbar. Clearing
+                // the UI override also restores it when returning to the same terminal cell.
+                self.display.window.set_ui_mouse_cursor(cursor);
                 self.handle_tab_bar_update(tab_update, event_proxy, scheduler);
                 self.handle_scrollbar_update(scrollbar_update, event_proxy);
 
-                if position.y < tab_height || tab_captured || scrollbar_captured {
+                if ui_captured {
                     return None;
                 }
                 position.y -= tab_height;

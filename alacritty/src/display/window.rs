@@ -97,6 +97,32 @@ impl From<crossfont::Error> for Error {
     }
 }
 
+/// Keep terminal cursor updates from overriding the tab bar or scrollbar cursor.
+struct MouseCursor {
+    terminal: CursorIcon,
+    ui: Option<CursorIcon>,
+}
+
+impl MouseCursor {
+    fn icon(&self) -> CursorIcon {
+        self.ui.unwrap_or(self.terminal)
+    }
+
+    fn set_terminal(&mut self, cursor: CursorIcon) -> Option<CursorIcon> {
+        let previous = self.icon();
+        self.terminal = cursor;
+        let current = self.icon();
+        (current != previous).then_some(current)
+    }
+
+    fn set_ui(&mut self, cursor: Option<CursorIcon>) -> Option<CursorIcon> {
+        let previous = self.icon();
+        self.ui = cursor;
+        let current = self.icon();
+        (current != previous).then_some(current)
+    }
+}
+
 /// A window which can be used for displaying the terminal.
 ///
 /// Wraps the underlying windowing library to provide a stable API in Alacritty.
@@ -119,7 +145,7 @@ pub struct Window {
     title: String,
 
     is_x11: bool,
-    current_mouse_cursor: CursorIcon,
+    mouse_cursor: MouseCursor,
     mouse_visible: bool,
     ime_inhibitor: ImeInhibitor,
 }
@@ -186,8 +212,8 @@ impl Window {
         let window = event_loop.create_window(window_attributes)?;
 
         // Text cursor.
-        let current_mouse_cursor = CursorIcon::Text;
-        window.set_cursor(current_mouse_cursor);
+        let mouse_cursor = MouseCursor { terminal: CursorIcon::Text, ui: None };
+        window.set_cursor(mouse_cursor.icon());
 
         // Enable IME.
         window.set_ime_allowed(true);
@@ -207,7 +233,7 @@ impl Window {
             hold: options.terminal_options.hold,
             requested_redraw: false,
             title: identity.title,
-            current_mouse_cursor,
+            mouse_cursor,
             mouse_visible: true,
             has_frame: true,
             scale_factor,
@@ -260,8 +286,15 @@ impl Window {
 
     #[inline]
     pub fn set_mouse_cursor(&mut self, cursor: CursorIcon) {
-        if cursor != self.current_mouse_cursor {
-            self.current_mouse_cursor = cursor;
+        if let Some(cursor) = self.mouse_cursor.set_terminal(cursor) {
+            self.window.set_cursor(cursor);
+        }
+    }
+
+    /// Override the terminal cursor while hovering or dragging the tab bar or scrollbar.
+    #[inline]
+    pub fn set_ui_mouse_cursor(&mut self, cursor: Option<CursorIcon>) {
+        if let Some(cursor) = self.mouse_cursor.set_ui(cursor) {
             self.window.set_cursor(cursor);
         }
     }
@@ -529,4 +562,47 @@ fn use_srgb_color_space(window: &WinitWindow) {
     };
 
     view.window().unwrap().setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_motion_does_not_reset_text_cursor() {
+        let mut cursor = MouseCursor { terminal: CursorIcon::Text, ui: None };
+
+        // Repeated terminal movements must not submit an intermediate arrow cursor.
+        for _ in 0..10 {
+            assert_eq!(cursor.set_ui(None), None);
+            assert_eq!(cursor.set_terminal(CursorIcon::Text), None);
+        }
+
+        assert_eq!(cursor.set_ui(Some(CursorIcon::Default)), Some(CursorIcon::Default));
+
+        // Returning to the same cell may skip terminal input's cursor update entirely.
+        assert_eq!(cursor.set_ui(None), Some(CursorIcon::Text));
+        assert_eq!(cursor.icon(), CursorIcon::Text);
+    }
+
+    #[test]
+    fn terminal_updates_do_not_override_controls() {
+        let mut cursor = MouseCursor { terminal: CursorIcon::Text, ui: None };
+
+        // Modifier, hint and PTY events can update the terminal cursor over a control.
+        assert_eq!(cursor.set_ui(Some(CursorIcon::Default)), Some(CursorIcon::Default));
+        assert_eq!(cursor.set_terminal(CursorIcon::Pointer), None);
+        assert_eq!(cursor.set_terminal(CursorIcon::Text), None);
+        assert_eq!(cursor.icon(), CursorIcon::Default);
+
+        // A scrollbar or tab drag keeps its pointer even outside the control's bounds.
+        assert_eq!(cursor.set_ui(Some(CursorIcon::Pointer)), Some(CursorIcon::Pointer));
+        assert_eq!(cursor.set_terminal(CursorIcon::Default), None);
+        assert_eq!(cursor.icon(), CursorIcon::Pointer);
+
+        // Restore the latest terminal mouse mode, then allow Shift selection and links.
+        assert_eq!(cursor.set_ui(None), Some(CursorIcon::Default));
+        assert_eq!(cursor.set_terminal(CursorIcon::Text), Some(CursorIcon::Text));
+        assert_eq!(cursor.set_terminal(CursorIcon::Pointer), Some(CursorIcon::Pointer));
+    }
 }
