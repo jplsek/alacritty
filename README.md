@@ -88,8 +88,11 @@ open a new tab to load the hook.
 
 ## Contributing
 
-A guideline about contributing to Alacritty can be found in the
-[`CONTRIBUTING.md`](CONTRIBUTING.md) file.
+This repository is a personal fork of Alacritty. Some documentation and FAQ
+entries come from upstream and may describe behavior that differs in this fork.
+The [upstream contribution guidelines](CONTRIBUTING.md) are kept here for
+reference. They apply to submissions to the upstream project, and parts of them
+may not apply to this fork.
 
 ## FAQ
 
