@@ -16,6 +16,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -63,6 +65,8 @@ use crate::message_bar::{Message, MessageBuffer};
 #[cfg(unix)]
 use crate::polling::ipc::{self, SocketReply};
 use crate::scheduler::{Scheduler, TimerId, Topic};
+#[cfg(unix)]
+use crate::session;
 use crate::window_context::WindowContext;
 
 /// Stable identifier for a terminal tab inside a native window.
@@ -112,6 +116,8 @@ pub struct Processor {
     gl_config: Option<GlutinConfig>,
     #[cfg(unix)]
     global_ipc_options: ParsedOptions,
+    #[cfg(unix)]
+    session: Option<session::Session>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
 }
@@ -156,6 +162,8 @@ impl Processor {
             windows: Default::default(),
             #[cfg(unix)]
             global_ipc_options: Default::default(),
+            #[cfg(unix)]
+            session: None,
             config_monitor,
         }
     }
@@ -168,7 +176,7 @@ impl Processor {
         &mut self,
         event_loop: &ActiveEventLoop,
         window_options: WindowOptions,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<WindowId, Box<dyn Error>> {
         let window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
@@ -177,9 +185,109 @@ impl Processor {
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
-        self.windows.insert(window_context.id(), window_context);
+        let window_id = window_context.id();
+        self.windows.insert(window_id, window_context);
+        Ok(window_id)
+    }
 
+    fn open_startup_windows(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        options: WindowOptions,
+    ) -> Result<(), Box<dyn Error>> {
+        #[cfg(unix)]
+        if let Some(path) = self.session_path() {
+            match session::Session::start(path) {
+                Ok((session, windows)) => {
+                    self.session = Some(session);
+                    if !windows.is_empty() {
+                        return self.restore_windows(event_loop, options, windows);
+                    }
+                },
+                Err(err) => warn!("Unable to start terminal session: {err}"),
+            }
+        }
+        self.create_initial_window(event_loop, options).map(|_| ())
+    }
+
+    #[cfg(unix)]
+    fn restore_windows(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        options: WindowOptions,
+        windows: Vec<session::WindowSession>,
+    ) -> Result<(), Box<dyn Error>> {
+        for (index, window) in windows.into_iter().enumerate() {
+            let active_tab = window.active_tab;
+            let mut directories = window.into_directories();
+            let mut options = options.clone();
+            options.terminal_options.working_directory = directories.next().flatten();
+            let window_id = if index == 0 {
+                self.create_initial_window(event_loop, options)?
+            } else {
+                match self.create_window(event_loop, options) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        warn!("Unable to restore terminal window: {err}");
+                        continue;
+                    },
+                }
+            };
+            if directories.len() != 0 {
+                self.windows.get_mut(&window_id).unwrap().restore_tabs(
+                    directories,
+                    active_tab,
+                    &self.proxy,
+                );
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn session_path(&self) -> Option<PathBuf> {
+        let terminal_options = &self.cli_options.window_options.terminal_options;
+        if !self.config.general.restore_working_directory
+            || self.cli_options.daemon
+            || self.cli_options.embed.is_some()
+            || self.config.debug.ref_test
+            || terminal_options.working_directory.is_some()
+            || terminal_options.command().is_some()
+            || terminal_options.hold
+        {
+            return None;
+        }
+
+        session::path()
+    }
+
+    #[cfg(unix)]
+    fn record_window_close(&mut self, window_id: WindowId) {
+        if !self.config.general.restore_working_directory {
+            return;
+        }
+        if let Some(session) = &mut self.session
+            && let Some(window) = self.windows.get(&window_id).filter(|window| !window.closing)
+        {
+            session.record_close(window.session(), SystemTime::now());
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_session(&mut self) {
+        let Some(mut session) = self.session.take() else { return };
+        if self.initial_window_error.is_some() || !self.config.general.restore_working_directory {
+            return;
+        }
+
+        let now = SystemTime::now();
+        // An application-wide quit can leave all window contexts intact.
+        for window in self.windows.values().filter(|window| !window.closing) {
+            session.record_close(window.session(), now);
+        }
+        if let Err(err) = session.finish() {
+            warn!("Unable to save terminal session: {err}");
+        }
     }
 
     /// Create a new terminal window.
@@ -187,7 +295,12 @@ impl Processor {
         &mut self,
         event_loop: &ActiveEventLoop,
         options: WindowOptions,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<WindowId, Box<dyn Error>> {
+        // Release current contexts before creating another surface, especially with Wayland EGL.
+        for window_context in self.windows.values_mut() {
+            window_context.display.make_not_current();
+        }
+
         let gl_config = self.gl_config.as_ref().unwrap();
 
         // Override config with CLI/IPC options.
@@ -206,8 +319,9 @@ impl Processor {
             config_overrides,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
-        Ok(())
+        let window_id = window_context.id();
+        self.windows.insert(window_id, window_context);
+        Ok(window_id)
     }
 
     /// Move an existing terminal tab into a newly created native window.
@@ -309,7 +423,7 @@ impl ApplicationHandler<Event> for Processor {
         }
 
         if let Some(window_options) = self.initial_window_options.take() {
-            if let Err(err) = self.create_initial_window(event_loop, window_options) {
+            if let Err(err) = self.open_startup_windows(event_loop, window_options) {
                 self.initial_window_error = Some(err);
                 event_loop.exit();
                 return;
@@ -332,6 +446,12 @@ impl ApplicationHandler<Event> for Processor {
         // Ignore all events we do not care about.
         if Self::skip_window_event(&event) {
             return;
+        }
+
+        #[cfg(unix)]
+        if matches!(event, WindowEvent::CloseRequested) {
+            // Query the shell directories before the tabs are torn down.
+            self.record_window_close(window_id);
         }
 
         let window_context = match self.windows.get_mut(&window_id) {
@@ -460,14 +580,6 @@ impl ApplicationHandler<Event> for Processor {
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
-                // XXX Ensure that no context is current when creating a new window,
-                // otherwise it may lock the backing buffer of the
-                // surface of current context when asking
-                // e.g. EGL on Wayland to create a new context.
-                for window_context in self.windows.values_mut() {
-                    window_context.display.make_not_current();
-                }
-
                 if self.gl_config.is_none() {
                     // Handle initial window creation in daemon mode.
                     if let Err(err) = self.create_initial_window(event_loop, options) {
@@ -541,6 +653,15 @@ impl ApplicationHandler<Event> for Processor {
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
                 if let Some(tab_id) = tab_id {
+                    #[cfg(unix)]
+                    if self
+                        .windows
+                        .get(window_id)
+                        .is_some_and(|window| window.is_exiting_last_tab(tab_id))
+                    {
+                        self.record_window_close(*window_id);
+                    }
+
                     let close_window =
                         self.windows.get_mut(window_id).is_some_and(|window_context| {
                             window_context.close_tab_by_id(tab_id, &mut self.scheduler)
@@ -627,6 +748,9 @@ impl ApplicationHandler<Event> for Processor {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
+
+        #[cfg(unix)]
+        self.finish_session();
 
         match self.gl_config.take().map(|config| config.display()) {
             #[cfg(not(target_os = "macos"))]
@@ -822,9 +946,7 @@ pub struct ActionContext<'a, N, T> {
     pub inline_search_state: &'a mut InlineSearchState,
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
-    pub preserve_title: bool,
     pub tab_id: TabId,
-    pub tab_title: &'a mut String,
     pub hold: &'a mut bool,
     #[cfg(not(windows))]
     pub master_fd: RawFd,
@@ -2075,20 +2197,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     self.ctx.display.pending_update.dirty = true;
                 },
                 EventType::Terminal(event) => match event {
-                    TerminalEvent::Title(title) => {
-                        if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
-                            *self.ctx.tab_title = title.clone();
-                            self.ctx.window().set_title(title);
-                        }
-                    },
-                    TerminalEvent::ResetTitle => {
-                        let window_config = &self.ctx.config.window;
-                        if !self.ctx.preserve_title && window_config.dynamic_title {
-                            let title = window_config.identity.title.clone();
-                            *self.ctx.tab_title = title.clone();
-                            self.ctx.display.window.set_title(title);
-                        }
-                    },
                     TerminalEvent::Bell => {
                         // Set window urgency hint when window is not focused.
                         let focused = self.ctx.terminal.is_focused;
@@ -2139,7 +2247,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::PtyWrite(text) => self.ctx.write_to_pty(text.into_bytes()),
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
-                    TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
+                    TerminalEvent::Exit
+                    | TerminalEvent::ChildExit(_)
+                    | TerminalEvent::Title(_)
+                    | TerminalEvent::ResetTitle
+                    | TerminalEvent::Wakeup => (),
                 },
                 #[cfg(unix)]
                 EventType::IpcConfig(_) | EventType::IpcGetConfig(..) | EventType::Shutdown => (),

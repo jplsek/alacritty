@@ -45,6 +45,8 @@ mod panic;
 mod polling;
 mod renderer;
 mod scheduler;
+#[cfg(unix)]
+mod session;
 mod string;
 mod tab_bar;
 mod window_context;

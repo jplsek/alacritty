@@ -54,6 +54,27 @@ This section documents the *[general]* table of the configuration file.
 
 	Default: _"None"_
 
+*restore_working_directory* = _true_ | _false_ # _(Unix only)_
+
+	Restore the windows from the final close group on the next normal launch.
+	Closing the last window by itself saves that window. Closing all remaining
+	windows together, for example from the taskbar, saves the whole group.
+	Window close requests within 750 milliseconds of the final request count
+	as a group.
+
+	Each window starts fresh shells in the saved directories and tab order,
+	with its last selected tab active. Tabs whose directory is unavailable use
+	the normal startup directory. Launching while another Alacritty instance
+	with session restore enabled is open creates a fresh window.
+
+	The state file is $XDG_STATE_HOME/alacritty/session.json, defaulting to
+	$HOME/.local/state/alacritty/session.json.
+
+	Launches with *--working-directory*, *--command*, or *--hold* use their
+	explicit options and skip session saving and restoration.
+
+	Default: _true_
+
 *live_config_reload* = _true_ | _false_
 
 	Live config reload (changes require restart)

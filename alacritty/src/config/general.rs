@@ -21,6 +21,9 @@ pub struct General {
     /// Shell startup directory.
     pub working_directory: Option<PathBuf>,
 
+    /// Restore tab working directories from the previous window session on startup.
+    pub restore_working_directory: bool,
+
     /// Live config reload.
     pub live_config_reload: bool,
 
@@ -33,6 +36,7 @@ impl Default for General {
     fn default() -> Self {
         Self {
             live_config_reload: true,
+            restore_working_directory: true,
             ipc_socket: true,
             working_directory: Default::default(),
             import: Default::default(),

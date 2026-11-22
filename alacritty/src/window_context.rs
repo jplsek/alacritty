@@ -6,6 +6,8 @@ use std::io::Write;
 use std::mem;
 #[cfg(not(windows))]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +50,8 @@ use crate::event::{
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
+#[cfg(unix)]
+use crate::session::WindowSession;
 use crate::tab_bar::{
     ScrollbarController, ScrollbarPointerUpdate, TabBarAction, TabBarController,
     TabBarPointerUpdate,
@@ -242,6 +246,7 @@ pub struct WindowContext {
     modifiers: Modifiers,
     occluded: bool,
     focused: bool,
+    pub(crate) closing: bool,
 }
 
 impl WindowContext {
@@ -407,6 +412,7 @@ impl WindowContext {
             modifiers: Default::default(),
             occluded: Default::default(),
             focused: true,
+            closing: false,
             dirty: true,
         };
         window_context.sync_tab_bar();
@@ -433,11 +439,62 @@ impl WindowContext {
                 crate::daemon::foreground_process_path(active.master_fd, active.shell_pid).ok();
         }
 
+        self.append_tab(config, options, config_overrides, proxy)?;
+        self.select_tab(self.tabs.len() - 1);
+        Ok(())
+    }
+
+    fn append_tab(
+        &mut self,
+        config: Rc<UiConfig>,
+        options: WindowOptions,
+        config_overrides: ParsedOptions,
+        proxy: EventLoopProxy<Event>,
+    ) -> Result<(), Box<dyn Error>> {
         let mut tab = TerminalTab::new(&self.display, config, options, proxy)?;
         tab.window_config = config_overrides;
         self.tabs.push(tab);
-        self.select_tab(self.tabs.len() - 1);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_tabs(
+        &mut self,
+        directories: impl Iterator<Item = Option<PathBuf>>,
+        active_tab: usize,
+        proxy: &EventLoopProxy<Event>,
+    ) {
+        let config = self.tabs[0].config.clone();
+        let mut selected_tab = 0;
+        // The initial window has already restored the first tab.
+        for (index, working_directory) in directories.enumerate() {
+            let mut options = WindowOptions::default();
+            options.terminal_options.working_directory = working_directory;
+            match self.append_tab(config.clone(), options, Default::default(), proxy.clone()) {
+                Ok(()) if index + 1 == active_tab => selected_tab = self.tabs.len() - 1,
+                Ok(()) => (),
+                Err(err) => log::warn!("Unable to restore terminal tab: {err}"),
+            }
+        }
+        if selected_tab == 0 {
+            self.sync_tab_bar();
+        } else {
+            self.select_tab(selected_tab);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn session(&self) -> WindowSession {
+        let directories = self
+            .tabs
+            .iter()
+            .map(|tab| crate::daemon::process_path(tab.shell_pid as libc::pid_t).ok());
+        WindowSession::new(directories, self.active_tab)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_exiting_last_tab(&self, tab_id: TabId) -> bool {
+        self.tabs.len() == 1 && self.tabs[0].id == tab_id && !self.tabs[0].hold
     }
 
     /// Apply a reloaded base configuration to every tab.
@@ -586,11 +643,26 @@ impl WindowContext {
             WinitEvent::UserEvent(event) => event.tab_id,
             _ => None,
         };
-        let target_index = target_tab
-            .and_then(|tab_id| self.tabs.iter().position(|tab| tab.id == tab_id))
-            .unwrap_or(self.active_tab);
+        let target_index = match target_tab {
+            Some(tab_id) => {
+                let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+                    return;
+                };
+                index
+            },
+            None => self.active_tab,
+        };
 
         match event {
+            // Titles are visible even for tabs whose input and rendering events are queued.
+            WinitEvent::UserEvent(Event {
+                payload: EventType::Terminal(TerminalEvent::Title(title)),
+                ..
+            }) => return self.update_tab_title(target_index, Some(title)),
+            WinitEvent::UserEvent(Event {
+                payload: EventType::Terminal(TerminalEvent::ResetTitle),
+                ..
+            }) => return self.update_tab_title(target_index, None),
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
                 if self.tabs[self.active_tab].event_queue.is_empty() {
@@ -633,9 +705,7 @@ impl WindowContext {
             master_fd: tab.master_fd,
             #[cfg(not(windows))]
             shell_pid: tab.shell_pid,
-            preserve_title: tab.preserve_title,
             tab_id: tab.id,
-            tab_title: &mut tab.title,
             hold: &mut tab.hold,
             config: &tab.config,
             event_proxy,
@@ -706,9 +776,12 @@ impl WindowContext {
 
         let event = match event {
             WindowEvent::CloseRequested => {
-                for tab in &mut self.tabs {
-                    tab.hold = false;
-                    tab.terminal.lock().exit();
+                if !self.closing {
+                    self.closing = true;
+                    for tab in &mut self.tabs {
+                        tab.hold = false;
+                        tab.terminal.lock().exit();
+                    }
                 }
                 return None;
             },
@@ -1107,6 +1180,25 @@ impl WindowContext {
         if self.display.window.has_frame && !self.occluded {
             self.display.window.request_redraw();
         }
+    }
+
+    fn update_tab_title(&mut self, index: usize, title: Option<String>) {
+        let tab = &mut self.tabs[index];
+        if tab.preserve_title || !tab.config.window.dynamic_title {
+            return;
+        }
+
+        let title = title.unwrap_or_else(|| tab.config.window.identity.title.clone());
+        if tab.title == title {
+            return;
+        }
+
+        tab.title = title;
+        if index == self.active_tab {
+            self.display.window.set_title(tab.title.clone());
+        }
+        self.sync_tab_bar();
+        self.request_slint_redraw(true);
     }
 
     fn sync_tab_bar(&self) {

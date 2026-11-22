@@ -113,16 +113,19 @@ where
 }
 
 /// Get working directory of controlling process.
-#[cfg(not(any(windows, target_os = "openbsd")))]
+#[cfg(not(windows))]
 pub fn foreground_process_path(
     master_fd: RawFd,
     shell_pid: u32,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let mut pid = unsafe { libc::tcgetpgrp(master_fd) };
-    if pid < 0 {
-        pid = shell_pid as pid_t;
-    }
+    let pid = unsafe { libc::tcgetpgrp(master_fd) };
+    let pid = if pid < 0 { shell_pid as pid_t } else { pid };
+    process_path(pid)
+}
 
+/// Get the working directory of a terminal's shell or a foreground process.
+#[cfg(not(any(windows, target_os = "openbsd")))]
+pub fn process_path(pid: pid_t) -> Result<PathBuf, Box<dyn Error>> {
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let link_path = format!("/proc/{pid}/cwd");
     #[cfg(target_os = "freebsd")]
@@ -138,14 +141,7 @@ pub fn foreground_process_path(
 }
 
 #[cfg(target_os = "openbsd")]
-pub fn foreground_process_path(
-    master_fd: RawFd,
-    shell_pid: u32,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let mut pid = unsafe { libc::tcgetpgrp(master_fd) };
-    if pid < 0 {
-        pid = shell_pid as pid_t;
-    }
+pub fn process_path(pid: pid_t) -> Result<PathBuf, Box<dyn Error>> {
     let name = [libc::CTL_KERN, libc::KERN_PROC_CWD, pid];
     let mut buf = [0u8; libc::PATH_MAX as usize];
     let result = unsafe {
