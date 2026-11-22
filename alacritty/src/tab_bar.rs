@@ -183,15 +183,21 @@ impl TabBarController {
         })
     }
 
-    pub fn set_tabs(&self, titles: impl IntoIterator<Item = (String, bool)>) {
-        let tabs = titles
+    pub fn set_tabs(&self, tabs: impl IntoIterator<Item = (String, bool, TabCommandStatus)>) {
+        let tabs = tabs
             .into_iter()
-            .map(|(title, active)| TabData { title: title.into(), active })
+            .map(|(title, active, command_status)| TabData {
+                title: title.into(),
+                active,
+                command_status,
+            })
             .collect::<Vec<_>>();
         let unchanged = self.model.row_count() == tabs.len()
             && tabs.iter().enumerate().all(|(index, tab)| {
                 self.model.row_data(index).is_some_and(|current| {
-                    current.title == tab.title && current.active == tab.active
+                    current.title == tab.title
+                        && current.active == tab.active
+                        && current.command_status == tab.command_status
                 })
             });
         if unchanged {
@@ -694,9 +700,9 @@ mod tests {
 
         let mut tab_bar = TabBarController::new().unwrap();
         tab_bar.set_tabs([
-            ("shell — alacritty".to_owned(), true),
-            ("cargo check".to_owned(), false),
-            ("logs".to_owned(), false),
+            ("shell — alacritty".to_owned(), true, TabCommandStatus::None),
+            ("cargo check".to_owned(), false, TabCommandStatus::Success),
+            ("logs".to_owned(), false, TabCommandStatus::Failure),
         ]);
         tab_bar.resize(800, 1.);
 
@@ -706,6 +712,10 @@ mod tests {
         assert_eq!((width, height), (800, TAB_BAR_HEIGHT as u32));
         assert!(updated);
         assert!(colors.len() > 8, "tab strip should contain text and multiple UI colors");
+        let success = (0x25, 0x47, 0x78);
+        let failure = (0xe9, 0xa2, 0x29);
+        assert!(colors.contains(&success));
+        assert!(colors.contains(&failure));
 
         if let Some(path) = std::env::var_os("SLINT_TAB_BAR_SCREENSHOT") {
             let mut file = File::create(path).unwrap();
@@ -715,6 +725,10 @@ mod tests {
             }
         }
         assert!(!tab_bar.render().3, "unchanged tab strip should reuse its framebuffer");
+
+        assert!(tab_bar.move_pointer(LogicalPosition::new(462., 18.)).pointer_cursor);
+        assert!(!tab_bar.render().0.iter().any(|pixel| (pixel.r, pixel.g, pixel.b) == success));
+        assert_eq!(click(&mut tab_bar, 462., 18.), Some(TabBarAction::Close(1)));
 
         let update = tab_bar.move_pointer(LogicalPosition::new(250., 18.));
         assert!(!update.pointer_cursor);
@@ -739,9 +753,9 @@ mod tests {
         assert!(tab_bar.is_dragging());
         assert_eq!(tab_bar.component.get_dragged_tab(), 1);
         tab_bar.set_tabs([
-            ("cargo check".to_owned(), false),
-            ("shell — alacritty".to_owned(), true),
-            ("logs".to_owned(), false),
+            ("cargo check".to_owned(), false, TabCommandStatus::Success),
+            ("shell — alacritty".to_owned(), true, TabCommandStatus::None),
+            ("logs".to_owned(), false, TabCommandStatus::Failure),
         ]);
 
         let update = tab_bar.move_pointer(LogicalPosition::new(550., 18.));

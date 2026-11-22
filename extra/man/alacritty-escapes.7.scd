@@ -254,6 +254,20 @@ brevity.
 |  _OSC 112_
 :  Implemented
 :[
+|  _OSC 133_
+:  Partial
+:[ Only *D* with an explicit exit status is supported, for background tab indicators
+
+## Background tab status
+
+When a shell emits *OSC 133 ; D ; exit-status ST*, Alacritty marks a background
+tab with the result. A navy dot means the command succeeded. An amber dot means
+it returned a nonzero status. Hover over the dot to reveal the close button, or
+select the tab to clear the dot.
+
+Enable shell integration that emits the command completion marker. For zsh,
+source _extra/shell-integration/alacritty.zsh_ from the Alacritty checkout in
+your _.zshrc_.
 
 # DCS (Device Control String) - ESC P
 

@@ -112,6 +112,7 @@ where
     {
         let mut unprocessed = 0;
         let mut processed = 0;
+        let mut command_status = CommandStatus::default();
 
         // Reserve the next terminal lock for PTY reading.
         let _terminal_lease = Some(self.terminal.lease());
@@ -151,6 +152,7 @@ where
             }
 
             // Parse the incoming bytes.
+            state.shell_parser.advance(&mut command_status, &buf[..unprocessed]);
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
 
             processed += unprocessed;
@@ -160,6 +162,10 @@ where
             if processed >= MAX_LOCKED_READ {
                 break;
             }
+        }
+
+        if let Some(status) = command_status.0 {
+            self.event_proxy.send_event(Event::CommandFinished(status));
         }
 
         // Queue terminal redraw unless all processed bytes were synchronized.
@@ -402,6 +408,41 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    // The ANSI processor does not expose unknown OSC sequences. Observe OSC 133 with the raw
+    // parser while leaving the main ANSI path and its synchronized updates intact.
+    shell_parser: vte::Parser,
+}
+
+#[derive(Default)]
+struct CommandStatus(Option<i32>);
+
+impl vte::Perform for CommandStatus {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let [b"133", b"D", status, ..] = params
+            && let Ok(status) = std::str::from_utf8(status)
+            && let Ok(status) = status.parse()
+        {
+            self.0 = Some(status);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn shell_command_completion_requires_an_exit_status() {
+    let mut parser = vte::Parser::new();
+    let mut status = CommandStatus::default();
+
+    parser.advance(&mut status, b"\x1b]133;A\x07\x1b]133;D\x07\x1b]133;D;invalid\x07");
+    assert_eq!(status.0, None);
+
+    parser.advance(&mut status, b"\x1b]133;D;");
+    assert_eq!(status.0, None);
+    parser.advance(&mut status, b"42\x07");
+    assert_eq!(status.0, Some(42));
+
+    parser.advance(&mut status, b"\x1b]133;D;0\x1b\\");
+    assert_eq!(status.0, Some(0));
 }
 
 impl State {

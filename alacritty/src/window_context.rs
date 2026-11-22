@@ -54,7 +54,7 @@ use crate::scheduler::Scheduler;
 use crate::session::WindowSession;
 use crate::tab_bar::{
     ScrollbarController, ScrollbarPointerUpdate, TabBarAction, TabBarController,
-    TabBarPointerUpdate,
+    TabBarPointerUpdate, TabCommandStatus,
 };
 use crate::{input, renderer};
 
@@ -94,6 +94,7 @@ mod tests {
 pub(crate) struct TerminalTab {
     id: TabId,
     title: String,
+    command_status: TabCommandStatus,
     message_buffer: MessageBuffer,
     event_queue: Vec<WinitEvent<Event>>,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
@@ -168,6 +169,7 @@ impl TerminalTab {
         Ok(Self {
             id,
             title,
+            command_status: TabCommandStatus::None,
             preserve_title,
             hold,
             terminal,
@@ -400,6 +402,7 @@ impl WindowContext {
             tab.notifier.on_resize(display.size_info.into());
             tab.terminal.lock().resize(display.size_info);
             tab.terminal.lock().is_focused = true;
+            tab.command_status = TabCommandStatus::None;
             display.window.set_title(tab.title.clone());
         }
 
@@ -1001,6 +1004,24 @@ impl WindowContext {
         }
     }
 
+    pub fn mark_command_finished(&mut self, tab_id: TabId, status: i32) {
+        let Some((index, tab)) = self.tabs.iter_mut().enumerate().find(|(_, tab)| tab.id == tab_id)
+        else {
+            return;
+        };
+        if index == self.active_tab {
+            return;
+        }
+
+        let status =
+            if status == 0 { TabCommandStatus::Success } else { TabCommandStatus::Failure };
+        if tab.command_status != status {
+            tab.command_status = status;
+            self.sync_tab_bar();
+            self.request_slint_redraw(true);
+        }
+    }
+
     /// Apply a tab action. Returns true when the native window should close.
     pub fn handle_tab_action(
         &mut self,
@@ -1164,6 +1185,7 @@ impl WindowContext {
 
     fn activate_tab(&mut self, index: usize, old_config: &UiConfig) {
         self.active_tab = index;
+        self.tabs[index].command_status = TabCommandStatus::None;
         self.tabs[self.active_tab].terminal.lock().is_focused = self.focused;
 
         let config = self.tabs[self.active_tab].config.clone();
@@ -1203,10 +1225,9 @@ impl WindowContext {
 
     fn sync_tab_bar(&self) {
         self.tab_bar.set_tabs(
-            self.tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| (tab.title.clone(), index == self.active_tab)),
+            self.tabs.iter().enumerate().map(|(index, tab)| {
+                (tab.title.clone(), index == self.active_tab, tab.command_status)
+            }),
         );
     }
 

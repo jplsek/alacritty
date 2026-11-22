@@ -651,6 +651,13 @@ impl ApplicationHandler<Event> for Processor {
                     window_context.mark_tab_dirty(tab_id);
                 }
             },
+            (EventType::Terminal(TerminalEvent::CommandFinished(status)), Some(window_id)) => {
+                if let Some(tab_id) = tab_id
+                    && let Some(window_context) = self.windows.get_mut(window_id)
+                {
+                    window_context.mark_command_finished(tab_id, status);
+                }
+            },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
                 if let Some(tab_id) = tab_id {
                     #[cfg(unix)]
@@ -2249,6 +2256,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit
                     | TerminalEvent::ChildExit(_)
+                    | TerminalEvent::CommandFinished(_)
                     | TerminalEvent::Title(_)
                     | TerminalEvent::ResetTitle
                     | TerminalEvent::Wakeup => (),

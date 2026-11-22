@@ -56,6 +56,9 @@ pub enum Event {
 
     /// Child process exited.
     ChildExit(ExitStatus),
+
+    /// The shell reported a completed command and its exit status.
+    CommandFinished(i32),
 }
 
 impl Debug for Event {
@@ -74,6 +77,7 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
+            Event::CommandFinished(status) => write!(f, "CommandFinished({status})"),
         }
     }
 }

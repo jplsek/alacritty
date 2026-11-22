@@ -1,6 +1,9 @@
+export enum TabCommandStatus { none, success, failure }
+
 export struct TabData {
     title: string,
     active: bool,
+    command-status: TabCommandStatus,
 }
 
 export global TabActions {
@@ -12,20 +15,37 @@ export global TabActions {
 component CloseButton inherits Rectangle {
     callback clicked();
     in property <bool> hovered;
+    in property <TabCommandStatus> command-status;
+    private property <bool> show-status: root.command-status != TabCommandStatus.none
+        && !root.hovered && !close-touch.has-hover;
 
     width: 24px;
     height: 24px;
     border-radius: 4px;
     background: root.hovered || close-touch.has-hover ? #ffffff18 : transparent;
     accessible-role: button;
-    accessible-label: "Close tab";
+    accessible-label: root.command-status == TabCommandStatus.success
+        ? "Close tab (command succeeded)"
+        : root.command-status == TabCommandStatus.failure ? "Close tab (command failed)" : "Close tab";
 
     Text {
         text: "×";
+        visible: !root.show-status;
         color: #d7dae0;
         font-size: 1.05rem;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+
+    if root.show-status : Rectangle {
+        width: 10px;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        border-width: 1px;
+        border-color: root.command-status == TabCommandStatus.success ? #6488bc : #f5bd56;
+        background: root.command-status == TabCommandStatus.success ? #254778 : #e9a229;
     }
 
     close-touch := TouchArea {
@@ -87,6 +107,7 @@ component TabButton inherits Rectangle {
             CloseButton {
                 y: (parent.height - self.height) / 2;
                 hovered: root.close-hovered;
+                command-status: tab.command-status;
                 clicked => { TabActions.close-tab(tab-index); }
             }
         }

@@ -74,6 +74,18 @@ On Windows, the config file will be looked for in:
 
 * `%APPDATA%\alacritty\alacritty.toml`
 
+### Shell Integration
+
+Some features requires shell integration. Add the following line to your
+`~/.zshrc` to load the [included zsh hook](extra/shell-integration/alacritty.zsh):
+
+```zsh
+source /path/to/alacritty/extra/shell-integration/alacritty.zsh
+```
+
+Replace `/path/to/alacritty` with the location of your Alacritty checkout, then
+open a new tab to load the hook.
+
 ## Contributing
 
 A guideline about contributing to Alacritty can be found in the
