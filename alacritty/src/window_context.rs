@@ -1,5 +1,6 @@
 //! Terminal window context.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
@@ -28,7 +29,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::{CursorIcon, WindowId};
 
-use alacritty_terminal::event::{Event as TerminalEvent, OnResize};
+use alacritty_terminal::event::Event as TerminalEvent;
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
@@ -44,7 +45,7 @@ use crate::display::Display;
 use crate::display::window::Window;
 use crate::event::{
     ActionContext, Event, EventProxy, EventType, InlineSearchState, Mouse, SearchState, TabAction,
-    TabId, TouchPurpose,
+    TabDrag, TabDrop, TabId, TouchPurpose,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -54,41 +55,11 @@ use crate::scheduler::Scheduler;
 use crate::session::WindowSession;
 use crate::tab_bar::{
     ScrollbarController, ScrollbarPointerUpdate, TabBarAction, TabBarController,
-    TabBarPointerUpdate, TabCommandStatus,
+    TabBarPointerUpdate, TabCommandStatus, TabData,
 };
 use crate::{input, renderer};
 
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
-
-fn index_after_move(index: usize, from: usize, to: usize) -> usize {
-    if index == from {
-        to
-    } else if from < to && index > from && index <= to {
-        index - 1
-    } else if to < from && index >= to && index < from {
-        index + 1
-    } else {
-        index
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::index_after_move;
-
-    #[test]
-    fn active_tab_index_follows_reordered_tabs() {
-        assert_eq!(index_after_move(0, 0, 2), 2);
-        assert_eq!(index_after_move(1, 0, 2), 0);
-        assert_eq!(index_after_move(2, 0, 2), 1);
-
-        assert_eq!(index_after_move(2, 2, 0), 0);
-        assert_eq!(index_after_move(0, 2, 0), 1);
-        assert_eq!(index_after_move(1, 2, 0), 2);
-
-        assert_eq!(index_after_move(3, 1, 2), 3);
-    }
-}
 
 /// State owned by one terminal tab.
 pub(crate) struct TerminalTab {
@@ -215,14 +186,6 @@ impl TerminalTab {
             true
         });
     }
-
-    pub(crate) fn id(&self) -> TabId {
-        self.id
-    }
-
-    pub(crate) fn config(&self) -> Rc<UiConfig> {
-        self.config.clone()
-    }
 }
 
 impl Drop for TerminalTab {
@@ -231,19 +194,16 @@ impl Drop for TerminalTab {
     }
 }
 
-pub(crate) struct TabDetachState {
-    index: usize,
-    active_tab: usize,
-    old_config: Rc<UiConfig>,
-}
-
 /// Event context for one individual Alacritty native window.
 pub struct WindowContext {
     pub display: Display,
     pub dirty: bool,
     tabs: Vec<TerminalTab>,
     active_tab: usize,
+    selected_tabs: HashSet<TabId>,
     tab_bar: TabBarController,
+    tab_drop: Option<TabDrop>,
+    tab_bar_shift: bool,
     scrollbar: ScrollbarController,
     modifiers: Modifiers,
     occluded: bool,
@@ -315,27 +275,17 @@ impl WindowContext {
         Ok(window_context)
     }
 
-    pub(crate) fn additional_with_tab(
+    /// Prepare the destination before removing any live terminals from the source.
+    pub(crate) fn additional_for_tabs(
         gl_config: &GlutinConfig,
         event_loop: &ActiveEventLoop,
-        tab: TerminalTab,
+        config: &UiConfig,
         size: PhysicalSize<u32>,
-    ) -> Result<Self, (Box<dyn Error>, TerminalTab)> {
-        let config = tab.config();
+    ) -> Result<Self, Box<dyn Error>> {
         let mut options = WindowOptions::default();
-        let display = match Self::additional_display(
-            gl_config,
-            event_loop,
-            &config,
-            &mut options,
-            Some(size),
-        ) {
-            Ok(display) => display,
-            Err(err) => return Err((err, tab)),
-        };
-
-        Self::from_tab(display, tab, true)
-            .map_err(|(err, tab)| (Box::new(err) as Box<dyn Error>, tab))
+        let display =
+            Self::additional_display(gl_config, event_loop, config, &mut options, Some(size))?;
+        Ok(Self::with_display(display, Vec::new())?)
     }
 
     fn additional_display(
@@ -376,43 +326,29 @@ impl WindowContext {
         proxy: EventLoopProxy<Event>,
     ) -> Result<Self, Box<dyn Error>> {
         let tab = TerminalTab::new(&display, config, options, proxy)?;
-        Self::from_tab(display, tab, false).map_err(|(err, _tab)| Box::new(err) as Box<dyn Error>)
+        Ok(Self::with_display(display, vec![tab])?)
     }
 
-    fn from_tab(
-        mut display: Display,
-        mut tab: TerminalTab,
-        moved_between_windows: bool,
-    ) -> Result<Self, (slint::PlatformError, TerminalTab)> {
-        let mut tab_bar = match TabBarController::new() {
-            Ok(tab_bar) => tab_bar,
-            Err(err) => return Err((err, tab)),
-        };
-        let mut scrollbar = match ScrollbarController::new() {
-            Ok(scrollbar) => scrollbar,
-            Err(err) => return Err((err, tab)),
-        };
+    fn with_display(
+        display: Display,
+        tabs: Vec<TerminalTab>,
+    ) -> Result<Self, slint::PlatformError> {
+        let mut tab_bar = TabBarController::new()?;
+        let mut scrollbar = ScrollbarController::new()?;
 
         let size = display.window.inner_size();
         let scale_factor = display.window.scale_factor as f32;
         tab_bar.resize(size.width, scale_factor);
         scrollbar.resize(size.width, size.height, scale_factor);
 
-        if moved_between_windows {
-            let window_id = display.window.id();
-            tab.retarget_window(window_id);
-            tab.notifier.on_resize(display.size_info.into());
-            tab.terminal.lock().resize(display.size_info);
-            tab.terminal.lock().is_focused = true;
-            tab.command_status = TabCommandStatus::None;
-            display.window.set_title(tab.title.clone());
-        }
-
         let window_context = Self {
             display,
-            tabs: vec![tab],
+            tabs,
             active_tab: 0,
+            selected_tabs: HashSet::new(),
             tab_bar,
+            tab_drop: None,
+            tab_bar_shift: false,
             scrollbar,
             modifiers: Default::default(),
             occluded: Default::default(),
@@ -423,11 +359,6 @@ impl WindowContext {
             rendered_frames: 0,
         };
         window_context.sync_tab_bar();
-        if moved_between_windows {
-            window_context.tabs[0]
-                .event_proxy
-                .send_event(TerminalEvent::CursorBlinkingChange.into());
-        }
         Ok(window_context)
     }
 
@@ -664,7 +595,11 @@ impl WindowContext {
                 self.dirty = true;
                 self.display.window.request_redraw();
             },
-            UiDebugAction::CreateTab | UiDebugAction::Resize { .. } | UiDebugAction::Redraw => {
+            UiDebugAction::CreateTab
+            | UiDebugAction::Resize { .. }
+            | UiDebugAction::Redraw
+            | UiDebugAction::TabPointer { .. }
+            | UiDebugAction::TabDrop { .. } => {
                 unreachable!("handled by the application event loop")
             },
         }
@@ -686,6 +621,7 @@ impl WindowContext {
                 let cursor = terminal.grid().cursor.point;
                 TabState {
                     id: tab.id.0,
+                    selected: self.selected_tabs.contains(&tab.id),
                     title: tab.title.clone(),
                     columns: terminal.columns(),
                     screen_lines: terminal.screen_lines(),
@@ -708,9 +644,15 @@ impl WindowContext {
             .collect();
         let size = self.display.window.inner_size();
         let surface_size = self.display.ui_debug_surface_size();
+        #[cfg(all(feature = "x11", not(target_os = "macos")))]
+        let native_position = self.display.window.inner_position().map(|point| (point.x, point.y));
+        #[cfg(not(all(feature = "x11", not(target_os = "macos"))))]
+        let native_position = None;
         WindowState {
             window_id: self.id().into(),
             active_tab: self.active_tab,
+            focused: self.focused,
+            native_position,
             native_width: size.width,
             native_height: size.height,
             surface_width: surface_size.width,
@@ -920,10 +862,15 @@ impl WindowContext {
                 WindowEvent::CursorMoved { device_id, position }
             },
             WindowEvent::MouseInput { device_id, state, button } => {
+                if button == MouseButton::Left && state == ElementState::Pressed {
+                    self.dismiss_tab_selection_on_pointer_press();
+                }
                 if self.tab_bar.contains_pointer() || self.tab_bar.captures_pointer() {
                     self.display.window.set_mouse_visible(true);
                     if button == MouseButton::Left {
-                        let update = self.tab_bar.pointer_button(state == ElementState::Pressed);
+                        let update = self
+                            .tab_bar
+                            .pointer_button(state == ElementState::Pressed, self.tab_bar_shift);
                         self.handle_tab_bar_update(update, event_proxy, scheduler);
                     }
                     return None;
@@ -966,10 +913,13 @@ impl WindowContext {
                 let mut scrollbar_update = self.scrollbar.move_pointer(logical_position);
                 let tab_captured = tab_update.captured;
                 self.handle_tab_bar_update(tab_update, event_proxy, scheduler);
+                if touch.phase == TouchPhase::Started {
+                    self.dismiss_tab_selection_on_pointer_press();
+                }
                 if touch.location.y < tab_height || tab_captured {
                     let update = match touch.phase {
-                        TouchPhase::Started => self.tab_bar.pointer_button(true),
-                        TouchPhase::Ended => self.tab_bar.pointer_button(false),
+                        TouchPhase::Started => self.tab_bar.pointer_button(true, false),
+                        TouchPhase::Ended => self.tab_bar.pointer_button(false, false),
                         TouchPhase::Cancelled => {
                             let redraw = self.tab_bar.cancel_pointer_press();
                             TabBarPointerUpdate { redraw, ..Default::default() }
@@ -1016,6 +966,10 @@ impl WindowContext {
                 self.tab_bar.resize(size.width, scale_factor as f32);
                 self.scrollbar.resize(size.width, size.height, scale_factor as f32);
                 WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer }
+            },
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.tab_bar_shift = modifiers.state().shift_key();
+                WindowEvent::ModifiersChanged(modifiers)
             },
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
@@ -1076,6 +1030,7 @@ impl WindowContext {
     ) {
         match action {
             TabBarAction::Select(index) => self.select_tab(index),
+            TabBarAction::SelectRange(index) => self.select_tab_range(index),
             TabBarAction::Close(index) if self.tabs.len() == 1 && index == 0 => {
                 self.tabs[0].hold = false;
                 self.tabs[0].terminal.lock().exit();
@@ -1083,16 +1038,25 @@ impl WindowContext {
             TabBarAction::Close(index) => {
                 self.close_tab(index, scheduler);
             },
-            TabBarAction::Reorder { from, to } => self.reorder_tab(from, to),
-            TabBarAction::Detach(index) => {
-                let action = EventType::TabAction(TabAction::Detach(index));
-                let _ = event_proxy.send_event(Event::new(action, self.id()));
+            TabBarAction::Drop { index, inside, source_slot } => {
+                if let Some(drag) = self.tab_drag(index) {
+                    self.tab_drop = Some(TabDrop {
+                        drag,
+                        position: self.tab_bar.cursor_position(),
+                        inside,
+                        source_slot,
+                    });
+                }
             },
             TabBarAction::New => {
                 let action = EventType::TabAction(TabAction::Create(WindowOptions::default()));
                 let _ = event_proxy.send_event(Event::new(action, self.id()));
             },
         }
+    }
+
+    pub(crate) fn take_tab_drop(&mut self) -> Option<TabDrop> {
+        self.tab_drop.take()
     }
 
     /// Handle a wakeup from a specific PTY.
@@ -1169,60 +1133,107 @@ impl WindowContext {
         self.tabs.iter().any(|tab| tab.id == tab_id)
     }
 
-    pub(crate) fn take_tab_for_detach(
-        &mut self,
-        index: usize,
-    ) -> Option<(TerminalTab, TabDetachState)> {
-        if index >= self.tabs.len() {
+    fn tab_drag(&self, index: usize) -> Option<TabDrag> {
+        let tab_id = self.tabs.get(index)?.id;
+        if self.selected_tabs.contains(&tab_id) {
+            let tabs = self.tabs.iter().filter(|tab| self.selected_tabs.contains(&tab.id));
+            Some(TabDrag {
+                tabs: tabs.map(|tab| tab.id).collect(),
+                active: self.tabs[self.active_tab].id,
+            })
+        } else {
+            Some(TabDrag { tabs: vec![tab_id], active: tab_id })
+        }
+    }
+
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    pub(crate) fn external_tab_drag(&self) -> Option<TabDrag> {
+        if self.tab_bar.contains_pointer() {
             return None;
         }
-
-        let state = TabDetachState {
-            index,
-            active_tab: self.active_tab,
-            old_config: self.tabs[self.active_tab].config.clone(),
-        };
-        let tab = self.tabs.remove(index);
-        tab.terminal.lock().is_focused = false;
-        Some((tab, state))
+        self.tab_drag(self.tab_bar.dragged_tab()?)
     }
 
-    pub(crate) fn restore_detached_tab(&mut self, tab: TerminalTab, state: TabDetachState) {
-        self.tabs.insert(state.index.min(self.tabs.len()), tab);
-        self.active_tab = state.active_tab.min(self.tabs.len() - 1);
-        self.tabs[self.active_tab].terminal.lock().is_focused = self.focused;
-        self.sync_tab_bar();
-        self.dirty = true;
-        if self.display.window.has_frame && !self.occluded {
-            self.display.window.request_redraw();
-        }
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    pub(crate) fn cancel_tab_drag(&mut self) {
+        let redraw = self.tab_bar.cancel_pointer_press();
+        self.request_slint_redraw(redraw);
     }
 
-    pub(crate) fn finish_tab_detach(&mut self, state: TabDetachState) -> bool {
-        if self.tabs.is_empty() {
-            return true;
-        }
+    pub(crate) fn tab_drop_slot(&self, position: LogicalPosition) -> usize {
+        self.tab_bar.drop_index(position).unwrap_or(self.tabs.len())
+    }
 
-        let detached_active_tab = state.index == state.active_tab;
-        if state.index < state.active_tab {
-            self.active_tab = state.active_tab - 1;
-        } else if state.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else {
-            self.active_tab = state.active_tab;
-        }
+    pub(crate) fn tab_config(&self, id: TabId) -> Option<Rc<UiConfig>> {
+        self.tabs.iter().find(|tab| tab.id == id).map(|tab| tab.config.clone())
+    }
 
-        if detached_active_tab {
-            self.activate_tab(self.active_tab, &state.old_config);
-        } else {
-            self.sync_tab_bar();
-            self.dirty = true;
-            if self.display.window.has_frame && !self.occluded {
-                self.display.window.request_redraw();
+    pub(crate) fn take_moved_tabs(
+        &mut self,
+        drag: &TabDrag,
+        scheduler: &mut Scheduler,
+    ) -> Vec<TerminalTab> {
+        let old_config = self.tabs[self.active_tab].config.clone();
+        let active_id = self.tabs[self.active_tab].id;
+        let fallback =
+            self.tabs[..self.active_tab].iter().filter(|tab| !drag.tabs.contains(&tab.id)).count();
+        let mut moved = Vec::new();
+        let window_id = self.id();
+        for tab in mem::take(&mut self.tabs) {
+            if drag.tabs.contains(&tab.id) {
+                if tab.id == active_id {
+                    tab.terminal.lock().is_focused = false;
+                }
+                scheduler.unschedule_tab(window_id, tab.id);
+                self.selected_tabs.remove(&tab.id);
+                moved.push(tab);
+            } else {
+                self.tabs.push(tab);
             }
         }
 
-        false
+        if !self.tabs.is_empty() {
+            self.active_tab = fallback.min(self.tabs.len() - 1);
+            if self.tabs[self.active_tab].id == active_id {
+                self.sync_tab_bar();
+                self.request_slint_redraw(true);
+            } else {
+                self.activate_tab(self.active_tab, &old_config);
+            }
+        }
+        moved
+    }
+
+    pub(crate) fn insert_moved_tabs(
+        &mut self,
+        mut tabs: Vec<TerminalTab>,
+        active_id: TabId,
+        slot: usize,
+    ) {
+        let active = tabs.iter().position(|tab| tab.id == active_id).unwrap();
+        let old_config = if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.terminal.lock().is_focused = false;
+            tab.config.clone()
+        } else {
+            tabs[active].config.clone()
+        };
+        let window_id = self.id();
+        self.selected_tabs.clear();
+        for tab in &mut tabs {
+            tab.retarget_window(window_id);
+            tab.mouse = Mouse::default();
+            tab.touch = TouchPurpose::default();
+        }
+        if tabs.len() > 1 {
+            self.selected_tabs.extend(tabs.iter().map(|tab| tab.id));
+        }
+        let slot = slot.min(self.tabs.len());
+        self.tabs.splice(slot..slot, tabs);
+        self.activate_tab(slot + active, &old_config);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
     }
 
     fn close_tab(&mut self, index: usize, scheduler: &mut Scheduler) -> bool {
@@ -1233,6 +1244,7 @@ impl WindowContext {
         let closing_active_tab = index == self.active_tab;
         let old_config = self.tabs[self.active_tab].config.clone();
         let tab_id = self.tabs[index].id;
+        self.selected_tabs.remove(&tab_id);
         scheduler.unschedule_tab(self.id(), tab_id);
         self.tabs.remove(index);
 
@@ -1247,6 +1259,7 @@ impl WindowContext {
         }
 
         if closing_active_tab {
+            self.selected_tabs.clear();
             self.activate_tab(self.active_tab, &old_config);
         } else {
             self.sync_tab_bar();
@@ -1260,7 +1273,16 @@ impl WindowContext {
     }
 
     fn select_tab(&mut self, index: usize) {
-        if index >= self.tabs.len() || index == self.active_tab {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let selection_changed = !self.selected_tabs.is_empty();
+        self.selected_tabs.clear();
+        if index == self.active_tab {
+            if selection_changed {
+                self.sync_tab_bar();
+                self.request_slint_redraw(true);
+            }
             return;
         }
 
@@ -1269,19 +1291,44 @@ impl WindowContext {
         self.activate_tab(index, &old_config);
     }
 
-    fn reorder_tab(&mut self, from: usize, to: usize) {
-        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+    fn select_tab_range(&mut self, index: usize) {
+        if index >= self.tabs.len() {
             return;
         }
-
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        self.active_tab = index_after_move(self.active_tab, from, to);
-        self.sync_tab_bar();
-        self.dirty = true;
-        if self.display.window.has_frame && !self.occluded {
-            self.display.window.request_redraw();
+        let start = self.active_tab.min(index);
+        let end = self.active_tab.max(index);
+        self.selected_tabs.clear();
+        if start != end {
+            self.selected_tabs.extend(self.tabs[start..=end].iter().map(|tab| tab.id));
         }
+        self.sync_tab_bar();
+        self.request_slint_redraw(true);
+    }
+
+    fn dismiss_tab_selection_on_pointer_press(&mut self) {
+        if !self.selected_tabs.is_empty()
+            && !self.tab_bar.captures_pointer()
+            && !self.tab_bar.pointer_over_tab()
+        {
+            self.selected_tabs.clear();
+            self.sync_tab_bar();
+            self.request_slint_redraw(true);
+        }
+    }
+
+    pub(crate) fn reorder_tabs(&mut self, drag: &TabDrag, slot: usize) {
+        let active_id = self.tabs[self.active_tab].id;
+        let slot = self.tabs[..slot.min(self.tabs.len())]
+            .iter()
+            .filter(|tab| !drag.tabs.contains(&tab.id))
+            .count();
+        let (moved, mut remaining): (Vec<_>, Vec<_>) =
+            mem::take(&mut self.tabs).into_iter().partition(|tab| drag.tabs.contains(&tab.id));
+        remaining.splice(slot..slot, moved);
+        self.tabs = remaining;
+        self.active_tab = self.tabs.iter().position(|tab| tab.id == active_id).unwrap();
+        self.sync_tab_bar();
+        self.request_slint_redraw(true);
     }
 
     fn activate_tab(&mut self, index: usize, old_config: &UiConfig) {
@@ -1328,11 +1375,12 @@ impl WindowContext {
     }
 
     fn sync_tab_bar(&self) {
-        self.tab_bar.set_tabs(
-            self.tabs.iter().enumerate().map(|(index, tab)| {
-                (tab.title.clone(), index == self.active_tab, tab.command_status)
-            }),
-        );
+        self.tab_bar.set_tabs(self.tabs.iter().enumerate().map(|(index, tab)| TabData {
+            title: tab.title.as_str().into(),
+            active: index == self.active_tab,
+            selected: self.selected_tabs.contains(&tab.id),
+            command_status: tab.command_status,
+        }));
     }
 
     /// Apply pending display geometry before rendering or processing the active tab's input queue.

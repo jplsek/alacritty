@@ -27,13 +27,16 @@ use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
+use slint::LogicalPosition;
 use winit::application::ApplicationHandler;
 use winit::event::{
-    ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
+    DeviceId, ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
+#[cfg(any(feature = "x11", feature = "wayland", target_os = "macos", windows))]
+use winit::raw_window_handle::RawWindowHandle;
 use winit::window::WindowId;
 
 use alacritty_terminal::event::{Event as TerminalEvent, EventListener, Notify};
@@ -73,12 +76,35 @@ use crate::window_context::WindowContext;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
 
+/// A drag carries stable IDs, since tabs may close while the pointer is held.
+#[derive(Clone, Debug)]
+pub(crate) struct TabDrag {
+    pub tabs: Vec<TabId>,
+    pub active: TabId,
+}
+
+pub(crate) struct TabDrop {
+    pub(crate) drag: TabDrag,
+    pub(crate) position: LogicalPosition,
+    pub(crate) inside: bool,
+    pub(crate) source_slot: Option<usize>,
+}
+
+/// Wait briefly for pointer focus to be reassigned after Wayland's implicit grab ends.
+#[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+struct WaylandTabDrop {
+    source: WindowId,
+    drag: TabDrag,
+    device: DeviceId,
+    entered: Option<WindowId>,
+    deadline: Instant,
+}
+
 /// Actions which change the tabs in a native window.
 #[derive(Debug, Clone)]
 pub enum TabAction {
     Create(WindowOptions),
     Close(usize),
-    Detach(usize),
     Select(usize),
     SelectNext,
     SelectPrevious,
@@ -100,6 +126,9 @@ const TOUCH_ZOOM_FACTOR: f32 = 0.01;
 /// Cooldown between invocations of the bell command.
 const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
 
+#[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+const WAYLAND_TAB_DROP_TIMEOUT: Duration = Duration::from_millis(25);
+
 /// The event processor.
 ///
 /// Stores some state from received events and dispatches actions when they are
@@ -112,6 +141,8 @@ pub struct Processor {
     initial_window_options: Option<WindowOptions>,
     initial_window_error: Option<Box<dyn Error>>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
+    #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+    wayland_tab_drop: Option<WaylandTabDrop>,
     proxy: EventLoopProxy<Event>,
     gl_config: Option<GlutinConfig>,
     #[cfg(unix)]
@@ -160,6 +191,8 @@ impl Processor {
             config: Rc::new(config),
             clipboard,
             windows: Default::default(),
+            #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+            wayland_tab_drop: None,
             #[cfg(unix)]
             global_ipc_options: Default::default(),
             #[cfg(unix)]
@@ -324,61 +357,309 @@ impl Processor {
         Ok(window_id)
     }
 
-    /// Move an existing terminal tab into a newly created native window.
-    fn detach_tab(
+    /// Transfer live terminals without starting or stopping their PTYs.
+    fn move_tabs(
         &mut self,
         event_loop: &ActiveEventLoop,
         source_window_id: WindowId,
-        tab_index: usize,
+        drag: TabDrag,
+        destination: Option<(WindowId, usize)>,
     ) -> Result<(), Box<dyn Error>> {
-        let Some(source_size) = self
-            .windows
-            .get(&source_window_id)
-            .map(|window_context| window_context.display.window.inner_size())
-        else {
+        let Some(source) = self.windows.get_mut(&source_window_id) else { return Ok(()) };
+        if source.closing || !drag.tabs.iter().all(|id| source.contains_tab(*id)) {
             return Ok(());
+        }
+        if let Some((id, slot)) = destination
+            && id == source_window_id
+        {
+            source.reorder_tabs(&drag, slot);
+            return Ok(());
+        }
+        let Some(config) = source.tab_config(drag.active) else { return Ok(()) };
+        let source_size = source.display.window.inner_size();
+
+        let (destination_id, slot) = if let Some((id, slot)) = destination {
+            if self.windows.get(&id).is_none_or(|window| window.closing) {
+                return Ok(());
+            }
+            (id, slot)
+        } else {
+            // Release current contexts before creating another surface, especially on Wayland EGL.
+            for context in self.windows.values_mut() {
+                context.display.make_not_current();
+            }
+            let window = WindowContext::additional_for_tabs(
+                self.gl_config.as_ref().unwrap(),
+                event_loop,
+                &config,
+                source_size,
+            )?;
+            let id = window.id();
+            self.windows.insert(id, window);
+            (id, 0)
         };
 
-        // Avoid locking another window's backing buffer while creating the destination context.
-        for window_context in self.windows.values_mut() {
-            window_context.display.make_not_current();
+        let source = self.windows.get_mut(&source_window_id).unwrap();
+        let tabs = source.take_moved_tabs(&drag, &mut self.scheduler);
+        if source.is_empty() {
+            self.windows.remove(&source_window_id);
+            self.scheduler.unschedule_window(source_window_id);
+        }
+        self.windows.get_mut(&destination_id).unwrap().insert_moved_tabs(tabs, drag.active, slot);
+        Ok(())
+    }
+
+    fn pointer_tab_drop(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_id: WindowId,
+        drop: TabDrop,
+        _device: Option<DeviceId>,
+    ) {
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        if !drop.inside
+            && self.windows.len() > 1
+            && let Some(device) = _device
+            && matches!(
+                self.windows[&source_id].display.window.raw_window_handle(),
+                RawWindowHandle::Wayland(_)
+            )
+        {
+            // An ordinary button grab keeps the pointer on the source during the drag.
+            // On release the compositor enters the surface now under the pointer.
+            self.wayland_tab_drop = Some(WaylandTabDrop {
+                source: source_id,
+                drag: drop.drag,
+                device,
+                entered: None,
+                deadline: Instant::now() + WAYLAND_TAB_DROP_TIMEOUT,
+            });
+            return;
         }
 
-        let Some((tab, detach_state)) = self
-            .windows
-            .get_mut(&source_window_id)
-            .and_then(|window_context| window_context.take_tab_for_detach(tab_index))
-        else {
-            return Ok(());
+        let target = self.desktop_tab_target(source_id, drop.position);
+        let destination = match target {
+            Some(destination) => Some(destination),
+            None if drop.inside => {
+                let Some(slot) = drop.source_slot else { return };
+                Some((source_id, slot))
+            },
+            None => None,
         };
-        let tab_id = tab.id();
+        if let Err(err) = self.move_tabs(event_loop, source_id, drop.drag, destination) {
+            error!("Could not move tabs: {err:?}");
+        }
+    }
 
-        let gl_config = self.gl_config.as_ref().unwrap();
-        match WindowContext::additional_with_tab(gl_config, event_loop, tab, source_size) {
-            Ok(window_context) => {
-                let destination_window_id = window_context.id();
-                self.windows.insert(destination_window_id, window_context);
-                self.scheduler.unschedule_tab(source_window_id, tab_id);
+    #[cfg(not(any(windows, target_os = "macos", feature = "x11")))]
+    fn desktop_tab_target(
+        &self,
+        _source_id: WindowId,
+        _position: LogicalPosition,
+    ) -> Option<(WindowId, usize)> {
+        None
+    }
 
-                let source_empty = self
-                    .windows
-                    .get_mut(&source_window_id)
-                    .is_some_and(|window_context| window_context.finish_tab_detach(detach_state));
-                if source_empty {
-                    if let Some(window_context) = self.windows.remove(&source_window_id) {
-                        self.scheduler.unschedule_window(window_context.id());
+    #[cfg(any(windows, all(feature = "x11", not(target_os = "macos"))))]
+    fn desktop_tab_target(
+        &self,
+        source_id: WindowId,
+        position: LogicalPosition,
+    ) -> Option<(WindowId, usize)> {
+        if self.windows.len() < 2 {
+            return None;
+        }
+        let source = &self.windows.get(&source_id)?.display.window;
+        let origin = source.inner_position()?;
+        let x = origin.x as f64 + f64::from(position.x) * source.scale_factor;
+        let y = origin.y as f64 + f64::from(position.y) * source.scale_factor;
+        let hit = match source.raw_window_handle() {
+            #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
+            RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_) => self.x11_tab_target(x, y),
+            #[cfg(windows)]
+            RawWindowHandle::Win32(_) => {
+                use windows_sys::Win32::Foundation::POINT;
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GA_ROOT, GetAncestor, WindowFromPoint,
+                };
+
+                // SAFETY: These APIs take a point or a live HWND returned by the window manager.
+                let hit = unsafe {
+                    GetAncestor(
+                        WindowFromPoint(POINT { x: x.round() as i32, y: y.round() as i32 }),
+                        GA_ROOT,
+                    )
+                };
+                self.windows.iter().find_map(|(id, context)| {
+                    match context.display.window.raw_window_handle() {
+                        RawWindowHandle::Win32(handle) if handle.hwnd.get() == hit as isize => {
+                            Some(*id)
+                        },
+                        _ => None,
+                    }
+                })
+            },
+            _ => None,
+        }?;
+        if hit == source_id {
+            return None;
+        }
+        let context = &self.windows[&hit];
+        let window = &context.display.window;
+        let origin = window.inner_position()?;
+        let position = LogicalPosition::new(
+            ((x - origin.x as f64) / window.scale_factor) as f32,
+            ((y - origin.y as f64) / window.scale_factor) as f32,
+        );
+        Some((hit, context.tab_drop_slot(position)))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn desktop_tab_target(
+        &self,
+        source_id: WindowId,
+        position: LogicalPosition,
+    ) -> Option<(WindowId, usize)> {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSView, NSWindow};
+        use objc2_foundation::NSPoint;
+
+        let mtm = MainThreadMarker::new()?;
+        let RawWindowHandle::AppKit(handle) =
+            self.windows.get(&source_id)?.display.window.raw_window_handle()
+        else {
+            return None;
+        };
+        // SAFETY: The views are owned by the live winit windows and accessed on the main thread.
+        let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+        let window = view.window()?;
+        let bounds = view.bounds();
+        let y = if view.isFlipped() {
+            position.y as f64
+        } else {
+            bounds.size.height - position.y as f64
+        };
+        let local = NSPoint::new(bounds.origin.x + position.x as f64, bounds.origin.y + y);
+        let point = window.convertPointToScreen(view.convertPoint_toView(local, None));
+        let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm);
+        self.windows.iter().filter(|(id, _)| **id != source_id).find_map(|(id, context)| {
+            let RawWindowHandle::AppKit(handle) = context.display.window.raw_window_handle() else {
+                return None;
+            };
+            let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+            let window = view.window()?;
+            if window.windowNumber() != hit {
+                return None;
+            }
+            let local = view.convertPoint_fromView(window.convertPointFromScreen(point), None);
+            let bounds = view.bounds();
+            let y = local.y - bounds.origin.y;
+            let y = if view.isFlipped() { y } else { bounds.size.height - y };
+            let position = LogicalPosition::new((local.x - bounds.origin.x) as f32, y as f32);
+            Some((*id, context.tab_drop_slot(position)))
+        })
+    }
+
+    #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
+    fn x11_tab_target(&self, x: f64, y: f64) -> Option<WindowId> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt;
+
+        let x = i16::try_from(x.round() as i32).ok()?;
+        let y = i16::try_from(y.round() as i32).ok()?;
+        let (connection, screen) = x11rb::connect(None).ok()?;
+        let root = connection.setup().roots.get(screen)?.root;
+        let mut window = root;
+        // Follow the topmost child at the drop point through the WM's decoration frames.
+        while window != x11rb::NONE {
+            if let Some(id) = self.windows.iter().find_map(|(id, context)| {
+                let xid = match context.display.window.raw_window_handle() {
+                    RawWindowHandle::Xlib(handle) => handle.window as u32,
+                    RawWindowHandle::Xcb(handle) => handle.window.get(),
+                    _ => return None,
+                };
+                (xid == window).then_some(*id)
+            }) {
+                return Some(id);
+            }
+            window = connection.translate_coordinates(root, window, x, y).ok()?.reply().ok()?.child;
+        }
+        None
+    }
+
+    #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+    fn follow_wayland_tab_drop(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: &WindowEvent,
+    ) {
+        let Some(drop) = &mut self.wayland_tab_drop else { return };
+        match *event {
+            WindowEvent::CursorEntered { device_id } if device_id == drop.device => {
+                drop.entered = Some(window_id);
+            },
+            WindowEvent::CursorMoved { device_id, position }
+                if device_id == drop.device && drop.entered == Some(window_id) =>
+            {
+                let drop = self.wayland_tab_drop.take().unwrap();
+                if window_id == drop.source {
+                    return;
+                }
+                if let Some(window) = self.windows.get(&window_id) {
+                    let position = position.to_logical::<f32>(window.display.window.scale_factor);
+                    let position = LogicalPosition::new(position.x, position.y);
+                    let slot = window.tab_drop_slot(position);
+                    if let Err(err) =
+                        self.move_tabs(event_loop, drop.source, drop.drag, Some((window_id, slot)))
+                    {
+                        error!("Could not move tabs: {err:?}");
                     }
                 }
-
-                Ok(())
             },
-            Err((err, tab)) => {
-                if let Some(window_context) = self.windows.get_mut(&source_window_id) {
-                    window_context.restore_detached_tab(tab, detach_state);
-                }
-                Err(err)
+            WindowEvent::MouseInput { device_id, .. } if device_id == drop.device => {
+                // Another click isn't part of the grab that just ended.
+                self.tear_off_wayland_tabs(event_loop);
             },
+            _ => (),
         }
+    }
+
+    #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+    fn tear_off_wayland_tabs(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(drop) = self.wayland_tab_drop.take()
+            && let Err(err) = self.move_tabs(event_loop, drop.source, drop.drag, None)
+        {
+            error!("Could not move tabs: {err:?}");
+        }
+    }
+
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    fn ui_debug_tab_drop(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_id: Option<WindowId>,
+        target_id: WindowId,
+        x: u32,
+        y: u32,
+    ) -> Result<crate::ui_debug::WindowState, String> {
+        let source_id = source_id.ok_or("specify a source --window-id")?;
+        if source_id == target_id {
+            return Err(String::from("specify a different target window"));
+        }
+        let drag = self
+            .windows
+            .get(&source_id)
+            .and_then(WindowContext::external_tab_drag)
+            .ok_or("move the pointer outside the source tab strip while dragging first")?;
+        let target = self.windows.get(&target_id).ok_or("no such target window")?;
+        let scale = target.display.window.scale_factor as f32;
+        let position = LogicalPosition::new(x as f32 / scale, y as f32 / scale);
+        let slot = target.tab_drop_slot(position);
+        self.windows.get_mut(&source_id).unwrap().cancel_tab_drag();
+        self.move_tabs(event_loop, source_id, drag, Some((target_id, slot)))
+            .map_err(|err| err.to_string())?;
+        Ok(self.windows[&target_id].ui_debug_state())
     }
 
     /// Run the event loop.
@@ -435,13 +716,16 @@ impl ApplicationHandler<Event> for Processor {
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
+
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        self.follow_wayland_tab_drop(event_loop, window_id, &event);
 
         // Ignore all events we do not care about.
         if Self::skip_window_event(&event) {
@@ -460,10 +744,18 @@ impl ApplicationHandler<Event> for Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
+        let release_device = match event {
+            WindowEvent::MouseInput {
+                device_id,
+                state: ElementState::Released,
+                button: MouseButton::Left,
+            } => Some(device_id),
+            _ => None,
+        };
 
         window_context.handle_event(
             #[cfg(target_os = "macos")]
-            _event_loop,
+            event_loop,
             &self.proxy,
             &mut self.clipboard,
             &mut self.scheduler,
@@ -472,6 +764,10 @@ impl ApplicationHandler<Event> for Processor {
 
         if is_redraw {
             window_context.draw(&mut self.scheduler);
+        }
+
+        if let Some(drop) = window_context.take_tab_drop() {
+            self.pointer_tab_drop(event_loop, window_id, drop, release_device);
         }
     }
 
@@ -501,9 +797,24 @@ impl ApplicationHandler<Event> for Processor {
         match (event.payload, event.window_id.as_ref()) {
             #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
             (EventType::IpcUiDebug(action, stream), window_id) => {
+                let send_reply = |result| {
+                    if let Ok(mut stream) = stream.try_clone() {
+                        ipc::send_reply(&mut stream, SocketReply::UiDebug(result));
+                    }
+                };
                 let window_id = window_id.copied().or_else(|| {
                     (self.windows.len() == 1).then(|| *self.windows.keys().next().unwrap())
                 });
+                if let crate::ui_debug::UiDebugAction::TabDrop { target_window_id, x, y } = action {
+                    send_reply(self.ui_debug_tab_drop(
+                        event_loop,
+                        window_id,
+                        target_window_id.into(),
+                        x,
+                        y,
+                    ));
+                    return;
+                }
                 let result = match window_id.and_then(|id| self.windows.get_mut(&id)) {
                     Some(window) => {
                         // Drain pending native/input events through the normal dispatch path.
@@ -571,18 +882,62 @@ impl ApplicationHandler<Event> for Processor {
                                     Ok(())
                                 }
                             },
+                            crate::ui_debug::UiDebugAction::TabPointer { x, y, action, shift } => {
+                                use crate::ui_debug::PointerAction;
+                                use winit::dpi::PhysicalPosition;
+                                use winit::event::DeviceId;
+                                use winit::keyboard::ModifiersState;
+
+                                let modifiers = if shift {
+                                    ModifiersState::SHIFT
+                                } else {
+                                    ModifiersState::empty()
+                                };
+                                let state = match action {
+                                    PointerAction::Move => None,
+                                    PointerAction::Press => Some(ElementState::Pressed),
+                                    PointerAction::Release => Some(ElementState::Released),
+                                };
+                                let device_id = DeviceId::dummy();
+                                let events = [
+                                    Some(WindowEvent::ModifiersChanged(modifiers.into())),
+                                    Some(WindowEvent::CursorMoved {
+                                        device_id,
+                                        position: PhysicalPosition::new(x.into(), y.into()),
+                                    }),
+                                    state.map(|state| WindowEvent::MouseInput {
+                                        device_id,
+                                        state,
+                                        button: MouseButton::Left,
+                                    }),
+                                ];
+                                for event in events.into_iter().flatten() {
+                                    window.handle_event(
+                                        #[cfg(target_os = "macos")]
+                                        event_loop,
+                                        &self.proxy,
+                                        &mut self.clipboard,
+                                        &mut self.scheduler,
+                                        WinitEvent::WindowEvent { window_id: window.id(), event },
+                                    );
+                                }
+                                Ok(())
+                            },
                             action => window.ui_debug_action(action),
                         };
-                        result.map(|()| window.ui_debug_state())
+                        let drop = window.take_tab_drop();
+                        let result = result.map(|()| window.ui_debug_state());
+                        if let Some(drop) = drop {
+                            self.pointer_tab_drop(event_loop, window_id.unwrap(), drop, None);
+                        }
+                        result
                     },
                     None => Err(format!(
                         "specify --window-id for one of the open windows: {:?}",
                         self.windows.keys().map(|id| u64::from(*id)).collect::<Vec<_>>()
                     )),
                 };
-                if let Ok(mut stream) = stream.try_clone() {
-                    ipc::send_reply(&mut stream, SocketReply::UiDebug(result));
-                }
+                send_reply(result);
             },
             // Process IPC config update.
             #[cfg(unix)]
@@ -673,11 +1028,6 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 } else if let Err(err) = self.create_window(event_loop, options) {
                     error!("Could not open window: {err:?}");
-                }
-            },
-            (EventType::TabAction(TabAction::Detach(index)), Some(window_id)) => {
-                if let Err(err) = self.detach_tab(event_loop, *window_id, index) {
-                    error!("Could not detach tab: {err:?}");
                 }
             },
             (EventType::TabAction(action), Some(window_id)) => {
@@ -811,6 +1161,11 @@ impl ApplicationHandler<Event> for Processor {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        if self.wayland_tab_drop.as_ref().is_some_and(|drop| drop.deadline <= Instant::now()) {
+            self.tear_off_wayland_tabs(event_loop);
+        }
+
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "About to wait");
         }
@@ -829,7 +1184,12 @@ impl ApplicationHandler<Event> for Processor {
 
         // Update the scheduler after event processing to ensure
         // the event loop deadline is as accurate as possible.
-        let control_flow = match self.scheduler.update() {
+        let deadline = self.scheduler.update();
+        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+        let deadline = self.wayland_tab_drop.as_ref().map_or(deadline, |drop| {
+            Some(deadline.map_or(drop.deadline, |deadline| deadline.min(drop.deadline)))
+        });
+        let control_flow = match deadline {
             Some(instant) => ControlFlow::WaitUntil(instant),
             None => ControlFlow::Wait,
         };

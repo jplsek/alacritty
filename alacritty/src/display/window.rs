@@ -258,6 +258,11 @@ impl Window {
         self.window.inner_size()
     }
 
+    #[cfg(any(windows, all(feature = "x11", not(target_os = "macos"))))]
+    pub fn inner_position(&self) -> Option<PhysicalPosition<i32>> {
+        self.window.inner_position().ok()
+    }
+
     #[inline]
     pub fn set_visible(&self, visibility: bool) {
         self.window.set_visible(visibility);

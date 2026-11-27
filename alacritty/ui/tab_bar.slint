@@ -3,6 +3,7 @@ export enum TabCommandStatus { none, success, failure }
 export struct TabData {
     title: string,
     active: bool,
+    selected: bool,
     command-status: TabCommandStatus,
 }
 
@@ -68,11 +69,12 @@ component TabButton inherits Rectangle {
     height: 100%;
     background: root.dragging
         ? #343a46
+        : tab.selected ? #293b55
         : tab.active ? #282c34 : root.hovered || tab-touch.has-hover ? #23272f : #1b1e24;
-    border-width: root.dragging ? 1px : 0px;
+    border-width: root.dragging || tab.selected ? 1px : 0px;
     border-color: #5ea1ff80;
     accessible-role: AccessibleRole.tab;
-    accessible-label: tab.title;
+    accessible-label: tab.selected ? tab.title + " (selected)" : tab.title;
 
     tab-touch := TouchArea {
         clicked => { TabActions.select-tab(tab-index); }
@@ -120,6 +122,7 @@ export component TabBar inherits Window {
     in property <int> hovered-close-tab: -1;
     in property <bool> new-tab-hovered;
     in property <int> dragged-tab: -1;
+    in property <int> drop-slot: -1;
     in property <length> tab-width: 184px;
 
     preferred-width: 800px;
@@ -164,6 +167,13 @@ export component TabBar inherits Window {
                 clicked => { TabActions.new-tab(); }
             }
         }
+    }
+
+    if root.drop-slot >= 0 : Rectangle {
+        x: min(root.width - self.width, max(0px, root.drop-slot * root.tab-width - 1px));
+        width: 2px;
+        height: parent.height;
+        background: #5ea1ff;
     }
 }
 

@@ -94,6 +94,17 @@ The [upstream contribution guidelines](CONTRIBUTING.md) are kept here for
 reference. They apply to submissions to the upstream project, and parts of them
 may not apply to this fork.
 
+### Moving tabs
+
+Drag a tab onto another window in the same Alacritty instance to move it. Drop
+it on that window's tab bar to choose where it goes, or on the terminal area to
+append it. Drop it outside Alacritty to open a new window.
+
+To move several tabs together, click the first tab, then Shift-click the last
+tab to highlight the range. Drag any highlighted tab to move the whole range
+in order. The terminals keep running, and their scrollback moves with them.
+Click outside the tabs to clear the selection without switching tabs.
+
 ## FAQ
 
 **_Is it really the fastest terminal emulator?_**
@@ -116,9 +127,9 @@ usecases.
 
 Alacritty has many great features, but not every feature from every other
 terminal. This could be for a number of reasons, but sometimes it's just not a
-good fit for Alacritty. This means you won't find things like tabs or splits
-(which are best left to a window manager or [terminal multiplexer][tmux]) nor
-niceties like a GUI config editor.
+good fit for Alacritty. Upstream Alacritty doesn't include tabs or splits and
+leaves those to a window manager or [terminal multiplexer][tmux]. It doesn't
+include a GUI config editor, either.
 
 [tmux]: https://github.com/tmux/tmux
 

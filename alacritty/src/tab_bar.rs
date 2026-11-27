@@ -33,9 +33,9 @@ const TAB_DRAG_THRESHOLD: f32 = 6.;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabBarAction {
     Select(usize),
+    SelectRange(usize),
     Close(usize),
-    Reorder { from: usize, to: usize },
-    Detach(usize),
+    Drop { index: usize, inside: bool, source_slot: Option<usize> },
     New,
 }
 
@@ -69,8 +69,9 @@ enum TabBarHitTarget {
 #[derive(Clone, Copy, Debug)]
 struct TabDragState {
     index: usize,
-    press_x: f32,
+    press_position: LogicalPosition,
     pointer_offset: f32,
+    shift: bool,
     dragging: bool,
 }
 
@@ -191,20 +192,14 @@ impl TabBarController {
         })
     }
 
-    pub fn set_tabs(&self, tabs: impl IntoIterator<Item = (String, bool, TabCommandStatus)>) {
-        let tabs = tabs
-            .into_iter()
-            .map(|(title, active, command_status)| TabData {
-                title: title.into(),
-                active,
-                command_status,
-            })
-            .collect::<Vec<_>>();
+    pub fn set_tabs(&self, tabs: impl IntoIterator<Item = TabData>) {
+        let tabs = tabs.into_iter().collect::<Vec<_>>();
         let unchanged = self.model.row_count() == tabs.len()
             && tabs.iter().enumerate().all(|(index, tab)| {
                 self.model.row_data(index).is_some_and(|current| {
                     current.title == tab.title
                         && current.active == tab.active
+                        && current.selected == tab.selected
                         && current.command_status == tab.command_status
                 })
             });
@@ -252,23 +247,20 @@ impl TabBarController {
         self.cursor_position = position;
         let target = self.hit_target(position);
         let mut redraw = self.hover_target.replace(target) != target;
-        let mut action = None;
 
         if let Some(mut drag_state) = self.drag_state.get() {
-            if !drag_state.dragging && (position.x - drag_state.press_x).abs() >= TAB_DRAG_THRESHOLD
-            {
+            let dx = position.x - drag_state.press_position.x;
+            let dy = position.y - drag_state.press_position.y;
+            if !drag_state.dragging && dx.hypot(dy) >= TAB_DRAG_THRESHOLD {
                 drag_state.dragging = true;
                 self.component.set_dragged_tab(drag_state.index as i32);
                 redraw = true;
             }
 
             if drag_state.dragging {
-                let target_index = self.drag_target(position.x, drag_state.pointer_offset);
-                if target_index != drag_state.index {
-                    action =
-                        Some(TabBarAction::Reorder { from: drag_state.index, to: target_index });
-                    drag_state.index = target_index;
-                    self.component.set_dragged_tab(target_index as i32);
+                let slot = self.reorder_index(position, drag_state).map_or(-1, |slot| slot as i32);
+                if self.component.get_drop_slot() != slot {
+                    self.component.set_drop_slot(slot);
                     redraw = true;
                 }
             }
@@ -285,11 +277,11 @@ impl TabBarController {
                 || matches!(target, TabBarHitTarget::Close(_) | TabBarHitTarget::New),
             redraw,
             captured: self.captures_pointer(),
-            action,
+            action: None,
         }
     }
 
-    pub fn pointer_button(&self, pressed: bool) -> TabBarPointerUpdate {
+    pub fn pointer_button(&self, pressed: bool, shift: bool) -> TabBarPointerUpdate {
         let target = self.hit_target(self.cursor_position);
         if pressed {
             self.pointer_inside_window.set(true);
@@ -298,8 +290,9 @@ impl TabBarController {
                 let tab_width = self.tab_width();
                 self.drag_state.set(Some(TabDragState {
                     index,
-                    press_x: self.cursor_position.x,
+                    press_position: self.cursor_position,
                     pointer_offset: self.cursor_position.x - index as f32 * tab_width,
+                    shift,
                     dragging: false,
                 }));
             }
@@ -314,20 +307,30 @@ impl TabBarController {
         let was_dragging = drag_state.is_some_and(|state| state.dragging);
         if was_dragging {
             self.component.set_dragged_tab(-1);
+            self.component.set_drop_slot(-1);
             let hover_target =
                 if self.pointer_inside_window.get() { target } else { TabBarHitTarget::Outside };
             self.update_hover(hover_target, false);
         }
         let pressed_target = self.pressed_target.take();
-        let action = if was_dragging && !self.pointer_inside_window.get() {
-            drag_state.map(|state| TabBarAction::Detach(state.index))
-        } else if was_dragging
-            || !self.pointer_inside_window.get()
-            || pressed_target != Some(target)
-        {
+        let action = if let Some(state) = drag_state.filter(|state| state.dragging) {
+            let inside = self.pointer_inside_window.get();
+            Some(TabBarAction::Drop {
+                index: state.index,
+                inside,
+                source_slot: if inside {
+                    self.reorder_index(self.cursor_position, state)
+                } else {
+                    None
+                },
+            })
+        } else if !self.pointer_inside_window.get() || pressed_target != Some(target) {
             None
         } else {
             match target {
+                TabBarHitTarget::Tab(index) if drag_state.is_some_and(|state| state.shift) => {
+                    Some(TabBarAction::SelectRange(index))
+                },
                 TabBarHitTarget::Tab(index) => Some(TabBarAction::Select(index)),
                 TabBarHitTarget::Close(index) => Some(TabBarAction::Close(index)),
                 TabBarHitTarget::New => Some(TabBarAction::New),
@@ -349,6 +352,7 @@ impl TabBarController {
         self.drag_state.set(None);
         if was_dragging {
             self.component.set_dragged_tab(-1);
+            self.component.set_drop_slot(-1);
         }
         was_dragging
     }
@@ -356,8 +360,12 @@ impl TabBarController {
     pub fn pointer_exited(&mut self) -> bool {
         self.pointer_inside_window.set(false);
         if self.captures_pointer() {
-            let redraw =
+            let mut redraw =
                 self.hover_target.replace(TabBarHitTarget::Outside) != TabBarHitTarget::Outside;
+            if self.component.get_drop_slot() != -1 {
+                self.component.set_drop_slot(-1);
+                redraw = true;
+            }
             if redraw {
                 self.update_hover(TabBarHitTarget::Outside, self.is_dragging());
             }
@@ -386,6 +394,14 @@ impl TabBarController {
             && self.hit_target(self.cursor_position) != TabBarHitTarget::Outside
     }
 
+    pub fn pointer_over_tab(&self) -> bool {
+        self.pointer_inside_window.get()
+            && matches!(
+                self.hit_target(self.cursor_position),
+                TabBarHitTarget::Tab(_) | TabBarHitTarget::Close(_)
+            )
+    }
+
     pub fn set_pointer_inside_window(&self, inside: bool) {
         self.pointer_inside_window.set(inside);
     }
@@ -398,6 +414,31 @@ impl TabBarController {
         self.drag_state.get().is_some_and(|state| state.dragging)
     }
 
+    #[cfg(all(unix, feature = "ui-debug", debug_assertions))]
+    pub fn dragged_tab(&self) -> Option<usize> {
+        self.drag_state.get().filter(|state| state.dragging).map(|state| state.index)
+    }
+
+    pub fn cursor_position(&self) -> LogicalPosition {
+        self.cursor_position
+    }
+
+    fn reorder_index(&self, position: LogicalPosition, state: TabDragState) -> Option<usize> {
+        self.drop_index(position)?;
+        let width = self.tab_width();
+        let center = position.x - state.pointer_offset + width / 2.;
+        let index = ((center / width).floor() as usize).min(self.model.row_count() - 1);
+        Some(if index > state.index { index + 1 } else { index })
+    }
+
+    /// Return the insertion slot at a position in the tab strip (including its empty space).
+    pub fn drop_index(&self, position: LogicalPosition) -> Option<usize> {
+        if self.hit_target(position) == TabBarHitTarget::Outside {
+            return None;
+        }
+        Some(((position.x / self.tab_width()).round() as usize).min(self.model.row_count()))
+    }
+
     fn tab_width(&self) -> f32 {
         let tab_count = self.model.row_count();
         if tab_count == 0 {
@@ -405,17 +446,6 @@ impl TabBarController {
         }
 
         ((self.logical_size().width - 40.) / tab_count as f32).clamp(96., 240.)
-    }
-
-    fn drag_target(&self, pointer_x: f32, pointer_offset: f32) -> usize {
-        let tab_count = self.model.row_count();
-        if tab_count <= 1 {
-            return 0;
-        }
-
-        let tab_width = self.tab_width();
-        let dragged_center = pointer_x - pointer_offset + tab_width / 2.;
-        (dragged_center / tab_width).floor().clamp(0., tab_count as f32 - 1.) as usize
     }
 
     fn update_hover(&self, target: TabBarHitTarget, dragging: bool) {
@@ -843,11 +873,19 @@ mod tests {
         init_platform().unwrap();
 
         let mut tab_bar = TabBarController::new().unwrap();
-        tab_bar.set_tabs([
-            ("shell — alacritty".to_owned(), true, TabCommandStatus::None),
-            ("cargo check".to_owned(), false, TabCommandStatus::Success),
-            ("logs".to_owned(), false, TabCommandStatus::Failure),
-        ]);
+        tab_bar.set_tabs(
+            [
+                ("shell — alacritty", true, true, TabCommandStatus::None),
+                ("cargo check", false, true, TabCommandStatus::Success),
+                ("logs", false, false, TabCommandStatus::Failure),
+            ]
+            .map(|(title, active, selected, command_status)| TabData {
+                title: title.into(),
+                active,
+                selected,
+                command_status,
+            }),
+        );
         tab_bar.resize(800, 1.);
 
         let (pixels, width, height, updated) = tab_bar.render();
@@ -860,6 +898,7 @@ mod tests {
         let failure = (0xe9, 0xa2, 0x29);
         assert!(colors.contains(&success));
         assert!(colors.contains(&failure));
+        assert!(colors.contains(&(0x29, 0x3b, 0x55)), "range selection must be visible");
 
         if let Some(path) = std::env::var_os("SLINT_TAB_BAR_SCREENSHOT") {
             let mut file = File::create(path).unwrap();
@@ -879,12 +918,14 @@ mod tests {
         assert!(update.redraw);
         assert!(!tab_bar.move_pointer(LogicalPosition::new(251., 18.)).redraw);
         assert_eq!(click(&mut tab_bar, 250., 18.), Some(TabBarAction::Select(1)));
+        tab_bar.pointer_button(true, true);
+        assert_eq!(tab_bar.pointer_button(false, false).action, Some(TabBarAction::SelectRange(1)));
 
         assert!(tab_bar.move_pointer(LogicalPosition::new(226., 18.)).pointer_cursor);
         assert_eq!(click(&mut tab_bar, 226., 18.), Some(TabBarAction::Close(0)));
 
         tab_bar.move_pointer(LogicalPosition::new(100., 18.));
-        let update = tab_bar.pointer_button(true);
+        let update = tab_bar.pointer_button(true, false);
         assert!(update.captured);
         assert_eq!(update.action, None);
         let update = tab_bar.move_pointer(LogicalPosition::new(104., 18.));
@@ -892,41 +933,46 @@ mod tests {
         assert!(!tab_bar.is_dragging());
 
         let update = tab_bar.move_pointer(LogicalPosition::new(300., 18.));
-        assert_eq!(update.action, Some(TabBarAction::Reorder { from: 0, to: 1 }));
+        assert_eq!(update.action, None, "do not reorder while dragging");
         assert!(update.captured);
         assert!(tab_bar.is_dragging());
-        assert_eq!(tab_bar.component.get_dragged_tab(), 1);
-        tab_bar.set_tabs([
-            ("cargo check".to_owned(), false, TabCommandStatus::Success),
-            ("shell — alacritty".to_owned(), true, TabCommandStatus::None),
-            ("logs".to_owned(), false, TabCommandStatus::Failure),
-        ]);
+        assert_eq!(tab_bar.component.get_dragged_tab(), 0);
+        assert_eq!(tab_bar.component.get_drop_slot(), 2);
 
-        let update = tab_bar.move_pointer(LogicalPosition::new(550., 18.));
-        assert_eq!(update.action, Some(TabBarAction::Reorder { from: 1, to: 2 }));
-        let update = tab_bar.pointer_button(false);
-        assert_eq!(update.action, None, "a drag must not select the release target");
+        tab_bar.move_pointer(LogicalPosition::new(550., 18.));
+        assert_eq!(tab_bar.component.get_drop_slot(), 3);
+        let update = tab_bar.pointer_button(false, false);
+        assert_eq!(
+            update.action,
+            Some(TabBarAction::Drop { index: 0, inside: true, source_slot: Some(3) }),
+        );
         assert!(update.redraw);
         assert!(!tab_bar.is_dragging());
         assert_eq!(tab_bar.component.get_dragged_tab(), -1);
 
         tab_bar.set_pointer_inside_window(true);
         tab_bar.move_pointer(LogicalPosition::new(100., 18.));
-        tab_bar.pointer_button(true);
-        tab_bar.move_pointer(LogicalPosition::new(110., 18.));
+        tab_bar.pointer_button(true, false);
+        tab_bar.move_pointer(LogicalPosition::new(100., 28.));
         assert!(tab_bar.is_dragging());
         assert!(tab_bar.pointer_exited());
         assert!(tab_bar.captures_pointer());
-        let update = tab_bar.pointer_button(false);
-        assert_eq!(update.action, Some(TabBarAction::Detach(0)));
+        let update = tab_bar.pointer_button(false, false);
+        assert_eq!(
+            update.action,
+            Some(TabBarAction::Drop { index: 0, inside: false, source_slot: None })
+        );
         assert!(!tab_bar.captures_pointer());
 
         tab_bar.set_pointer_inside_window(true);
         tab_bar.move_pointer(LogicalPosition::new(100., 18.));
-        tab_bar.pointer_button(true);
+        tab_bar.pointer_button(true, false);
         tab_bar.move_pointer(LogicalPosition::new(110., TAB_BAR_HEIGHT + 20.));
         assert!(tab_bar.is_dragging());
-        assert_eq!(tab_bar.pointer_button(false).action, None);
+        assert_eq!(
+            tab_bar.pointer_button(false, false).action,
+            Some(TabBarAction::Drop { index: 0, inside: true, source_slot: None }),
+        );
 
         tab_bar.resize(1_000, 1.);
         tab_bar.render();
@@ -1002,9 +1048,9 @@ mod tests {
     fn click(tab_bar: &mut TabBarController, x: f32, y: f32) -> Option<TabBarAction> {
         tab_bar.set_pointer_inside_window(true);
         tab_bar.move_pointer(LogicalPosition::new(x, y));
-        let update = tab_bar.pointer_button(true);
+        let update = tab_bar.pointer_button(true, false);
         assert_eq!(update.action, None);
         assert!(update.captured);
-        tab_bar.pointer_button(false).action
+        tab_bar.pointer_button(false, false).action
     }
 }

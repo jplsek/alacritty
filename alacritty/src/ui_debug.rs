@@ -3,7 +3,7 @@
 //! Actions run on the UI thread against real windows, PTYs, and the renderer. This module is
 //! excluded from release builds, even when the Cargo feature is enabled.
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[derive(Args, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -30,12 +30,33 @@ pub enum UiDebugAction {
     Output { data: String },
     /// Process queued events and render one frame, including partial damage.
     Redraw,
+    /// Dispatch a tab-bar mouse event at window-local physical coordinates.
+    TabPointer {
+        #[clap(allow_negative_numbers = true)]
+        x: i32,
+        #[clap(allow_negative_numbers = true)]
+        y: i32,
+        action: PointerAction,
+        #[clap(long)]
+        shift: bool,
+    },
+    /// Deliver a drop from an in-progress tab drag to another window's client surface.
+    TabDrop { target_window_id: u64, x: u32, y: u32 },
+}
+
+#[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerAction {
+    Move,
+    Press,
+    Release,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WindowState {
     pub window_id: u64,
     pub active_tab: usize,
+    pub focused: bool,
+    pub native_position: Option<(i32, i32)>,
     pub native_width: u32,
     pub native_height: u32,
     pub surface_width: u32,
@@ -51,6 +72,7 @@ pub struct WindowState {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TabState {
     pub id: u64,
+    pub selected: bool,
     pub title: String,
     pub columns: usize,
     pub screen_lines: usize,
